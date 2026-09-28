@@ -1,0 +1,28 @@
+[package]
+name = "disk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Disk images for forensic intake: raw and split raw images, GPT and MBR partitions, NTFS file listing and streaming reads (alternate data streams included)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Sootmark/disk"
+publish = false
+
+[dependencies]
+ntfs = "0.4"
+
+[dev-dependencies]
+proptest = "1"
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
