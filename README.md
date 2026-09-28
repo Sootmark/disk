@@ -2,8 +2,13 @@
 
 Disk images for forensic intake: raw and split raw images, GPT and MBR partition tables, file-system identification, and NTFS file listing with streaming reads, alternate data streams included. Nothing is extracted to disk. Written from scratch; the only dependency is [`Sootmark/common`](https://github.com/Sootmark/common).
 
+```toml
+[dependencies]
+sootmark-disk = "0.2"
+```
+
 ```rust
-use disk::{identify, partitions, Filesystem, NtfsVolume, SplitImage};
+use sootmark_disk::{identify, partitions, Filesystem, NtfsVolume, SplitImage};
 
 let mut image = SplitImage::open("case/fin-wks-07.001".as_ref())?;
 let length = image.len();

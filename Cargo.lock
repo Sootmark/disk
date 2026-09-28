@@ -36,19 +36,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
-name = "common"
-version = "0.3.1"
-source = "git+https://github.com/Sootmark/common?tag=v0.3.1#7e58fa4444246f9ce2b5a9cc23ff07320ce099a0"
-
-[[package]]
-name = "disk"
-version = "0.2.2"
-dependencies = [
- "common",
- "proptest",
-]
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,6 +238,20 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
+]
+
+[[package]]
+name = "sootmark-common"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd82ca69e758140dc089a1eae16fc466477a48f9097ab3f7d2788ccf6536290"
+
+[[package]]
+name = "sootmark-disk"
+version = "0.2.3"
+dependencies = [
+ "proptest",
+ "sootmark-common",
 ]
 
 [[package]]

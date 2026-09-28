@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 
 use common::sha256::{hex, Sha256};
-use disk::{
+use sootmark_disk::{
     identify, partitions, FileEntry, Filesystem, NtfsVolume, PartitionType, Scheme, SplitImage,
     SECTOR_SIZE,
 };

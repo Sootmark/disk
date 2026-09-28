@@ -3,8 +3,8 @@
 
 use std::io::{Cursor, Read};
 
-use disk::{identify, partitions, NtfsVolume};
 use proptest::prelude::*;
+use sootmark_disk::{identify, partitions, NtfsVolume};
 
 const IMAGE: &[u8] = include_bytes!("fixtures/fin-wks-07.img");
 /// Bytes read per file, as a real consumer would budget: declared sizes of

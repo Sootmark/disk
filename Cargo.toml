@@ -1,15 +1,18 @@
 [package]
-name = "disk"
-version = "0.2.2"
+name = "sootmark-disk"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.80"
 description = "Disk images for forensic intake: raw and split raw images, GPT and MBR partitions, NTFS file listing and streaming reads (alternate data streams included)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Sootmark/disk"
-publish = false
+homepage = "https://sootmark.com"
+keywords = ["forensics", "dfir", "incident-response"]
+# Sources only: test fixtures (disk images, logs, test keys) stay in the repository.
+include = ["/src", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
 [dependencies]
-common = { git = "https://github.com/Sootmark/common", tag = "v0.3.1", version = "0.3.1" }
+common = { package = "sootmark-common", version = "0.3.2" }
 
 [dev-dependencies]
 proptest = "1"
