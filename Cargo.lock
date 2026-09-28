@@ -37,12 +37,12 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "common"
-version = "0.3.0"
-source = "git+https://github.com/Sootmark/common?tag=v0.3.0#df761c5b0c903b43988e3a8fde5611fac0d0b12a"
+version = "0.3.1"
+source = "git+https://github.com/Sootmark/common?tag=v0.3.1#7e58fa4444246f9ce2b5a9cc23ff07320ce099a0"
 
 [[package]]
 name = "disk"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "common",
  "proptest",

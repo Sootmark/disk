@@ -1,6 +1,6 @@
 [package]
 name = "disk"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Disk images for forensic intake: raw and split raw images, GPT and MBR partitions, NTFS file listing and streaming reads (alternate data streams included)."
@@ -9,7 +9,7 @@ repository = "https://github.com/Sootmark/disk"
 publish = false
 
 [dependencies]
-common = { git = "https://github.com/Sootmark/common", tag = "v0.3.0", version = "0.3.0" }
+common = { git = "https://github.com/Sootmark/common", tag = "v0.3.1", version = "0.3.1" }
 
 [dev-dependencies]
 proptest = "1"
