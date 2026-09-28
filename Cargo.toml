@@ -1,6 +1,6 @@
 [package]
 name = "disk"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Disk images for forensic intake: raw and split raw images, GPT and MBR partitions, NTFS file listing and streaming reads (alternate data streams included)."
@@ -9,11 +9,10 @@ repository = "https://github.com/Sootmark/disk"
 publish = false
 
 [dependencies]
-ntfs = "0.4"
+common = { git = "https://github.com/Sootmark/common", tag = "v0.2.0", version = "0.2.0" }
 
 [dev-dependencies]
 proptest = "1"
-sha2 = "0.10"
 
 [lints.rust]
 unsafe_code = "forbid"

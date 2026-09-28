@@ -1,15 +1,14 @@
 //! The synthetic FIN-WKS-07 disk (see `tests/fixtures/make-samples.py`),
 //! checked against The Sleuth Kit: `mmls`, `fls -r -p -o 256` and `icat`.
 
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 
+use common::sha256::{hex, Sha256};
 use disk::{
     identify, partitions, FileEntry, Filesystem, NtfsVolume, PartitionType, Scheme, SplitImage,
     SECTOR_SIZE,
 };
-use sha2::{Digest, Sha256};
 
 const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fin-wks-07.img");
 const BASIC_DATA: &str = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7";
@@ -32,10 +31,7 @@ fn sha256_of<R: Read + Seek>(volume: &NtfsVolume, disk: &mut R, entry: &FileEntr
             std::io::copy(reader, &mut hasher).map(|_| ())
         })
         .unwrap();
-    hasher.finalize().iter().fold(String::new(), |mut hex, b| {
-        let _ = write!(hex, "{b:02x}");
-        hex
-    })
+    hex(&hasher.finalize())
 }
 
 #[test]

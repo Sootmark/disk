@@ -1,6 +1,6 @@
 # disk
 
-Disk images for forensic intake: raw and split raw images, GPT and MBR partition tables, file-system identification, and NTFS file listing with streaming reads, alternate data streams included. Nothing is extracted to disk.
+Disk images for forensic intake: raw and split raw images, GPT and MBR partition tables, file-system identification, and NTFS file listing with streaming reads, alternate data streams included. Nothing is extracted to disk. Written from scratch; the only dependency is [`Sootmark/common`](https://github.com/Sootmark/common).
 
 ```rust
 use disk::{identify, partitions, Filesystem, NtfsVolume, SplitImage};
@@ -31,15 +31,19 @@ Any `Read + Seek` works as a disk, so container formats (VHDX, E01) plug in by p
 | File contents (`$MFT`, `rclone.conf`, `Zone.Identifier`, …) | byte-identical to `icat` (SHA-256) |
 | Split images (`.001`, `.002`, …) | read identically to the whole image |
 
+## How NTFS is read
+
+The MFT is walked record by record, the way forensic MFT parsers do: update-sequence fixups are verified (torn writes are detected, never silently accepted), paths are rebuilt from each record's `$FILE_NAME` parent reference, and attributes stored in extension records are merged into their base record. Files whose parent chain is broken are placed under `$OrphanFiles`, as The Sleuth Kit does. Sparse ranges and data past the initialized length read as zeros.
+
 ## Hostile images
 
-Corrupted partition tables and NTFS structures yield errors or fewer files, never a crash. File-system structures are read by the [`ntfs`](https://crates.io/crates/ntfs) crate, which can panic on some malformed data; every call into it is guarded and turned into an error.
+Corrupted partition tables, MFT records and data runs yield errors or fewer files, never a crash (fuzzed with tens of thousands of corrupted images). Arithmetic on sizes and cluster numbers read from disk is checked.
 
 Declared sizes are not proof of data: sparse streams (`$UsnJrnl:$J`) legitimately declare far more than they store, and a corrupt record can declare anything. Bound what you read; the fuzz tests do.
 
 ## Scope
 
-NTFS allocated files and named streams. Deleted files, carving, FAT/exFAT listing and Volume Shadow Copies are out of scope for now (FAT and exFAT are identified).
+NTFS allocated files and named streams. Not yet: compressed (LZNT1) and encrypted (EFS) streams (reported as unsupported), deleted files, carving, FAT/exFAT listing, Volume Shadow Copies (FAT and exFAT are identified).
 
 ## License
 
