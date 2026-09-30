@@ -7,6 +7,7 @@
 //! Directory indexes are not needed.
 
 mod boot;
+mod lznt1;
 mod reader;
 mod record;
 mod runs;
@@ -16,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read, Seek};
 
 use boot::Boot;
-use reader::{Extents, StreamReader};
+use reader::{CompressedReader, Extents, StreamReader};
 use record::{flags, kind, Attribute, Body, FileName, Record, DOS_NAMESPACE};
 
 use crate::partition::read_at;
@@ -78,6 +79,8 @@ struct Index {
 enum Stream {
     Resident(Vec<u8>),
     NonResident(Extents),
+    /// LZNT1-compressed, in units of this many clusters.
+    Compressed(Extents, u64),
     Unsupported(&'static str),
 }
 
@@ -125,8 +128,8 @@ impl NtfsVolume {
     /// bound what they read (e.g. with [`Read::take`]).
     ///
     /// # Errors
-    /// When the stream can't be read (including compressed or encrypted
-    /// streams, not supported yet).
+    /// When the stream can't be read (including encrypted streams, not
+    /// supported yet). Compressed streams (LZNT1) are decompressed.
     pub fn read<R: Read + Seek>(
         &self,
         disk: &mut R,
@@ -145,6 +148,16 @@ impl NtfsVolume {
             Stream::NonResident(extents) => {
                 let mut volume = Window::new(disk, self.start, self.length);
                 let mut reader = StreamReader::new(&mut volume, &extents, self.boot.cluster_size);
+                consume(&mut reader)
+            }
+            Stream::Compressed(extents, unit_clusters) => {
+                let mut volume = Window::new(disk, self.start, self.length);
+                let mut reader = CompressedReader::new(
+                    &mut volume,
+                    &extents,
+                    self.boot.cluster_size,
+                    unit_clusters,
+                );
                 consume(&mut reader)
             }
             Stream::Unsupported(what) => Err(io::Error::new(io::ErrorKind::Unsupported, what)),
@@ -278,7 +291,7 @@ fn build_index(nodes: &BTreeMap<u64, Node>) -> Index {
             let stream = stream_of(&sets, &name);
             let size = match &stream {
                 Stream::Resident(bytes) => bytes.len() as u64,
-                Stream::NonResident(extents) => extents.real_size,
+                Stream::NonResident(extents) | Stream::Compressed(extents, _) => extents.real_size,
                 Stream::Unsupported(_) => declared_size(&sets, &name),
             };
             files.push(FileEntry {
@@ -326,9 +339,6 @@ fn stream_of(sets: &[&[Attribute]], name: &str) -> Stream {
     if pieces.iter().any(|a| a.flags & flags::ENCRYPTED != 0) {
         return Stream::Unsupported("encrypted (EFS) stream");
     }
-    if pieces.iter().any(|a| a.flags & flags::COMPRESSED != 0) {
-        return Stream::Unsupported("compressed stream");
-    }
     if let Some(Body::Resident(bytes)) = pieces.first().map(|a| &a.body) {
         return Stream::Resident(bytes.clone());
     }
@@ -341,22 +351,35 @@ fn stream_of(sets: &[&[Attribute]], name: &str) -> Stream {
         real_size: 0,
         initialized_size: 0,
     };
+    let compressed = pieces.iter().any(|a| a.flags & flags::COMPRESSED != 0);
+    let mut unit = 0;
     for piece in pieces {
         if let Body::NonResident {
             first_vcn,
             runs,
             real_size,
             initialized_size,
+            compression_unit,
         } = &piece.body
         {
             if *first_vcn == 0 {
                 extents.real_size = *real_size;
                 extents.initialized_size = *initialized_size;
+                if compressed {
+                    unit = *compression_unit;
+                }
             }
             extents.runs.extend_from_slice(runs);
         }
     }
-    Stream::NonResident(extents)
+    if !compressed {
+        return Stream::NonResident(extents);
+    }
+    // The unit size is on the first piece: 16 clusters in practice.
+    match unit {
+        1..=8 => Stream::Compressed(extents, 1 << unit),
+        _ => Stream::Unsupported("compressed stream with an unusual compression unit"),
+    }
 }
 
 fn declared_size(sets: &[&[Attribute]], name: &str) -> u64 {

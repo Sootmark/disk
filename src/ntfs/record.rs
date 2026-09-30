@@ -58,6 +58,8 @@ pub(crate) enum Body {
         runs: Vec<Run>,
         real_size: u64,
         initialized_size: u64,
+        /// Clusters per compression unit, as a power of two (0: none).
+        compression_unit: u16,
     },
 }
 
@@ -159,7 +161,8 @@ fn parse_attribute(bytes: &[u8], kind: u32) -> Result<Attribute> {
         let first_vcn = r.u64_le()?;
         r.skip(8)?; // last VCN
         let runs_offset = usize::from(r.u16_le()?);
-        r.skip(6 + 8)?; // compression unit, padding, allocated size
+        let compression_unit = r.u16_le()?;
+        r.skip(4 + 8)?; // padding, allocated size
         let real_size = r.u64_le()?;
         let initialized_size = r.u64_le()?;
         let runs = runs::decode(
@@ -172,6 +175,7 @@ fn parse_attribute(bytes: &[u8], kind: u32) -> Result<Attribute> {
             runs,
             real_size,
             initialized_size,
+            compression_unit,
         }
     } else {
         let length = r.u32_le()? as usize;

@@ -93,3 +93,110 @@ impl<V: Read + Seek> Read for StreamReader<'_, V> {
         Ok(wanted)
     }
 }
+
+/// Reads an NTFS-compressed stream a compression unit at a time: a unit
+/// with all its clusters allocated is stored as is, one with none reads
+/// as zeros, and one whose allocated clusters end early holds LZNT1 data.
+pub(crate) struct CompressedReader<'a, V> {
+    volume: &'a mut V,
+    extents: &'a Extents,
+    cluster_size: u64,
+    /// Clusters per compression unit.
+    unit_clusters: u64,
+    unit: Vec<u8>,
+    /// Which unit `unit` holds.
+    loaded: Option<u64>,
+    position: u64,
+}
+
+impl<'a, V: Read + Seek> CompressedReader<'a, V> {
+    pub(crate) fn new(
+        volume: &'a mut V,
+        extents: &'a Extents,
+        cluster_size: u64,
+        unit_clusters: u64,
+    ) -> Self {
+        Self {
+            volume,
+            extents,
+            cluster_size,
+            unit_clusters,
+            unit: Vec::new(),
+            loaded: None,
+            position: 0,
+        }
+    }
+
+    /// Where each cluster of unit `index` is on the volume (`None`: sparse).
+    fn clusters(&self, index: u64) -> Vec<Option<u64>> {
+        let first = index * self.unit_clusters;
+        let mut out = Vec::with_capacity(self.unit_clusters as usize);
+        let mut vcn = 0u64;
+        for run in &self.extents.runs {
+            let end = vcn.saturating_add(run.clusters);
+            let from = first.max(vcn);
+            let to = end.min(first + self.unit_clusters);
+            for v in from..to {
+                out.push(run.lcn.map(|lcn| lcn + (v - vcn)));
+            }
+            vcn = end;
+            if vcn >= first + self.unit_clusters {
+                break;
+            }
+        }
+        out.resize(self.unit_clusters as usize, None);
+        out
+    }
+
+    fn load(&mut self, index: u64) -> io::Result<()> {
+        let unit_bytes = (self.unit_clusters * self.cluster_size) as usize;
+        let clusters = self.clusters(index);
+        let allocated: Vec<u64> = clusters.iter().map_while(|c| *c).collect();
+        let mut raw = Vec::with_capacity(allocated.len() * self.cluster_size as usize);
+        for lcn in &allocated {
+            let at = lcn.checked_mul(self.cluster_size).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "cluster outside the volume")
+            })?;
+            let start = raw.len();
+            raw.resize(start + self.cluster_size as usize, 0);
+            self.volume.seek(SeekFrom::Start(at))?;
+            self.volume.read_exact(&mut raw[start..])?;
+        }
+        self.unit = if allocated.len() == clusters.len() {
+            raw
+        } else if allocated.is_empty() {
+            vec![0; unit_bytes]
+        } else {
+            let mut out = Vec::with_capacity(unit_bytes);
+            super::lznt1::decompress(&raw, unit_bytes, &mut out)?;
+            out.resize(unit_bytes, 0);
+            out
+        };
+        self.loaded = Some(index);
+        Ok(())
+    }
+}
+
+impl<V: Read + Seek> Read for CompressedReader<'_, V> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let size = self.extents.real_size;
+        if buf.is_empty() || self.position >= size {
+            return Ok(0);
+        }
+        let unit_bytes = self.unit_clusters * self.cluster_size;
+        let index = self.position / unit_bytes;
+        if self.loaded != Some(index) {
+            self.load(index)?;
+        }
+        let within = (self.position % unit_bytes) as usize;
+        let available = (unit_bytes as usize - within).min((size - self.position) as usize);
+        let n = buf.len().min(available);
+        if self.position >= self.extents.initialized_size {
+            buf[..n].fill(0);
+        } else {
+            buf[..n].copy_from_slice(&self.unit[within..within + n]);
+        }
+        self.position += n as u64;
+        Ok(n)
+    }
+}

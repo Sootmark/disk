@@ -36,9 +36,11 @@ Any `Read + Seek` works as a disk, so container formats (VHDX, E01) plug in by p
 | File contents (`$MFT`, `rclone.conf`, `Zone.Identifier`, …) | byte-identical to `icat` (SHA-256) |
 | Split images (`.001`, `.002`, …) | read identically to the whole image |
 
+Compressed files (LZNT1): `tests/fixtures/ntfs-compressed.img.zlib` is a volume written by ntfs-3g (a compressed folder holding text, incompressible, mixed and sparse files, and a plain copy); every file reads as ntfs-3g reads it. On a real Windows Server 2022 image (CFReDS "Compromised Windows Server 2022", not redistributed), all 268 compressed files read identically to ntfs-3g.
+
 ## How NTFS is read
 
-The MFT is walked record by record, the way forensic MFT parsers do: update-sequence fixups are verified (torn writes are detected, never silently accepted), paths are rebuilt from each record's `$FILE_NAME` parent reference, and attributes stored in extension records are merged into their base record. Files whose parent chain is broken are placed under `$OrphanFiles`, as The Sleuth Kit does. Sparse ranges and data past the initialized length read as zeros.
+The MFT is walked record by record, the way forensic MFT parsers do: update-sequence fixups are verified (torn writes are detected, never silently accepted), paths are rebuilt from each record's `$FILE_NAME` parent reference, and attributes stored in extension records are merged into their base record. Files whose parent chain is broken are placed under `$OrphanFiles`, as The Sleuth Kit does. Sparse ranges and data past the initialized length read as zeros. Compressed streams are read a compression unit (16 clusters) at a time: all clusters allocated means stored as is, none means zeros, and allocated clusters ending early hold LZNT1 data.
 
 ## Hostile images
 
@@ -48,7 +50,7 @@ Declared sizes are not proof of data: sparse streams (`$UsnJrnl:$J`) legitimatel
 
 ## Scope
 
-NTFS allocated files and named streams. Not yet: compressed (LZNT1) and encrypted (EFS) streams (reported as unsupported), deleted files, carving, FAT/exFAT listing, Volume Shadow Copies (FAT and exFAT are identified).
+NTFS allocated files and named streams, compressed (LZNT1) streams decompressed a compression unit at a time. Not yet: encrypted (EFS) streams (reported as unsupported), deleted files, carving, FAT/exFAT listing, Volume Shadow Copies (FAT and exFAT are identified).
 
 ## License
 
