@@ -36,6 +36,8 @@ Any `Read + Seek` works as a disk, so container formats (VHDX, E01) plug in by p
 | File contents (`$MFT`, `rclone.conf`, `Zone.Identifier`, …) | byte-identical to `icat` (SHA-256) |
 | Split images (`.001`, `.002`, …) | read identically to the whole image |
 
+FAT and exFAT: `tests/fixtures/fat/` holds a FAT12, a FAT16, a FAT32 and an exFAT volume written on Linux (long names with accents, nested folders, files fragmented around deleted ones, an empty file); every allocated file and its content match The Sleuth Kit (`fls`, `icat`). On NIST's CFReDS Data Leakage USB images (not redistributed), the exFAT drive's files match TSK's allocated tree; the FAT32 drive holds none (its files were deleted).
+
 Compressed files (LZNT1): `tests/fixtures/ntfs-compressed.img.zlib` is a volume written by ntfs-3g (a compressed folder holding text, incompressible, mixed and sparse files, and a plain copy); every file reads as ntfs-3g reads it. On a real Windows Server 2022 image (CFReDS "Compromised Windows Server 2022", not redistributed), all 268 compressed files read identically to ntfs-3g.
 
 ## How NTFS is read
@@ -50,7 +52,7 @@ Declared sizes are not proof of data: sparse streams (`$UsnJrnl:$J`) legitimatel
 
 ## Scope
 
-NTFS allocated files and named streams, compressed (LZNT1) streams decompressed a compression unit at a time. Not yet: encrypted (EFS) streams (reported as unsupported), deleted files, carving, FAT/exFAT listing, Volume Shadow Copies (FAT and exFAT are identified).
+NTFS allocated files and named streams, compressed (LZNT1) streams decompressed a compression unit at a time. FAT12, FAT16, FAT32 and exFAT volumes: allocated files (long names included) listed and read through their cluster chains. Not yet: encrypted (EFS) streams (reported as unsupported), deleted files, carving, Volume Shadow Copies.
 
 ## License
 
