@@ -139,7 +139,8 @@ impl FatVolume {
             0 => u64::from(u32_at(boot, 32)),
             n => u64::from(n),
         };
-        let fat_sectors = match u16_at(boot, 22) {
+        let fat16_sectors = u16_at(boot, 22);
+        let fat_sectors = match fat16_sectors {
             0 => u64::from(u32_at(boot, 36)),
             n => u64::from(n),
         };
@@ -154,10 +155,14 @@ impl FatVolume {
         let root_sectors = (root_entries * ENTRY as u64).div_ceil(bytes_per_sector);
         let data_sector = reserved + fats * fat_sectors + root_sectors;
         let cluster_count = total.saturating_sub(data_sector) / sectors_per_cluster;
-        // The cluster count, not a label, decides the FAT type.
-        let kind = match cluster_count {
-            0..=4084 => FatKind::Fat12,
-            4085..=65_524 => FatKind::Fat16,
+        // FAT32's boot sector leaves the 16-bit FAT size at 0 (small FAT32
+        // volumes exist: Linux writes and reads them); otherwise the
+        // cluster count decides between FAT12 and FAT16, as the
+        // specification says.
+        let kind = match (fat16_sectors, cluster_count) {
+            (0, _) => FatKind::Fat32,
+            (_, 0..=4084) => FatKind::Fat12,
+            (_, 4085..=65_524) => FatKind::Fat16,
             _ => FatKind::Fat32,
         };
         let fixed_root = (kind != FatKind::Fat32).then(|| {

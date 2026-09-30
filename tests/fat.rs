@@ -95,3 +95,40 @@ fn an_inflated_cluster_count_is_cut_to_the_volume() {
     let fat = FatVolume::open(&mut disk, 0, length).unwrap();
     assert_eq!(fat.files().len(), 28);
 }
+
+/// A small FAT32 (fewer clusters than the specification's FAT32 minimum,
+/// as Linux writes them): the `E:` volume of `fin-wks-07.img`, generated
+/// by `tests/fixtures/make-samples.py`, read as FAT32 from its boot sector.
+#[test]
+fn a_small_fat32_is_read_as_fat32() {
+    let image =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fin-wks-07.img"))
+            .unwrap();
+    let length = image.len() as u64;
+    let mut disk = Cursor::new(image);
+    let (_, parts) = sootmark_disk::partitions(&mut disk, length).unwrap();
+    let part = parts.iter().find(|p| p.slot == 2).unwrap();
+    let fat = FatVolume::open(&mut disk, part.offset, part.length).unwrap();
+    assert_eq!(fat.kind(), FatKind::Fat32);
+    let paths: Vec<String> = fat.files().iter().map(|f| f.path.join("/")).collect();
+    assert_eq!(
+        paths,
+        [
+            "System Volume Information/IndexerVolumeGuid",
+            "exfil/Q3_forecast_board_pack.zip",
+            "exfil/payroll_2026-08.csv",
+            "exfil/vendor_master.csv",
+        ]
+    );
+    let payroll = &fat.files()[2];
+    let mut hasher = Sha256::new();
+    fat.read(&mut disk, payroll, &mut |r| {
+        std::io::copy(r, &mut hasher).map(|_| ())
+    })
+    .unwrap();
+    // The generator's PAYROLL content.
+    assert_eq!(
+        common::hex::encode(&hasher.finalize()),
+        "ed84d3f9d569e907de906f59b1514fe55fd3475b10a22f081fad2579c1037727"
+    );
+}
