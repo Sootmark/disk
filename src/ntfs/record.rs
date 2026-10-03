@@ -2,8 +2,10 @@
 
 use common::bytes::{Error, ErrorKind, Reader, Result};
 use common::text;
+use common::time::Ts;
 
 use super::runs::{self, Run};
+use crate::times::{known, Times};
 
 const FILE_SIGNATURE: &[u8; 4] = b"FILE";
 /// Fixups protect the last two bytes of every 512-byte stride.
@@ -16,6 +18,7 @@ const RECORD_NUMBER_MASK: u64 = 0x0000_ffff_ffff_ffff;
 
 /// Attribute type codes used here.
 pub(crate) mod kind {
+    pub(crate) const STANDARD_INFORMATION: u32 = 0x10;
     pub(crate) const FILE_NAME: u32 = 0x30;
     pub(crate) const DATA: u32 = 0x80;
 }
@@ -225,5 +228,21 @@ pub(crate) fn file_name(value: &[u8]) -> Result<FileName> {
         parent_sequence: reference_sequence(parent_reference),
         name,
         namespace,
+    })
+}
+
+/// The times of a `$STANDARD_INFORMATION` value: four FILETIMEs (created,
+/// modified, MFT entry changed, accessed).
+pub(crate) fn standard_information(value: &[u8]) -> Result<Times> {
+    let mut r = Reader::new(value);
+    let mut next = || {
+        r.u64_le()
+            .map(|filetime| known(Ts::from_filetime(filetime)))
+    };
+    Ok(Times {
+        created: next()?,
+        modified: next()?,
+        changed: next()?,
+        accessed: next()?,
     })
 }

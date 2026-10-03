@@ -1,9 +1,9 @@
 [package]
 name = "sootmark-disk"
-version = "0.2.6"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Disk images for forensic intake: raw and split raw images, GPT and MBR partitions, NTFS (alternate data streams, compression), FAT and exFAT file listing and streaming reads."
+description = "Disk images for forensic intake: raw and split raw images, GPT and MBR partitions, NTFS (alternate data streams, compression), FAT and exFAT file listing with times, and streaming reads."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Sootmark/disk"
 homepage = "https://sootmark.com"
@@ -12,7 +12,7 @@ keywords = ["forensics", "dfir", "incident-response"]
 include = ["/src", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
 [dependencies]
-common = { package = "sootmark-common", version = "0.3.2" }
+common = { package = "sootmark-common", version = "0.3.6" }
 
 [dev-dependencies]
 proptest = "1"

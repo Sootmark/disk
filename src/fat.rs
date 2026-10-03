@@ -10,11 +10,18 @@
 //! the clusters are contiguous and need no FAT) and File Name entries.
 //! Deleted entries aren't listed. Every chain is bounded by the volume's
 //! cluster count, so a looping FAT ends a file early instead of hanging.
+//!
+//! Times are MS-DOS date and time words: wall-clock, to 2 seconds, with a
+//! 10 ms refinement for creation (and exFAT's modification), and a date
+//! alone for FAT's last access. exFAT adds a UTC offset to each.
 
 use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};
 
+use common::time::{Precision, Ts, TICKS_PER_SECOND};
+
 use crate::ntfs::FileEntry;
+use crate::times::{known, Times};
 use crate::window::Window;
 
 /// Clusters 0 and 1 are reserved; data starts at cluster 2.
@@ -37,6 +44,13 @@ const EXFAT_STREAM: u8 = 0xc0;
 const EXFAT_NAME: u8 = 0xc1;
 /// Stream Extension flag: the clusters are contiguous, the FAT unused.
 const EXFAT_NO_FAT_CHAIN: u8 = 0x02;
+/// UTC offset flag: the low 7 bits are a signed count of 15 minutes.
+const EXFAT_OFFSET_VALID: u8 = 0x80;
+
+/// 100 ns ticks in 10 ms.
+const CENTISECOND: i64 = TICKS_PER_SECOND / 100;
+/// The largest valid 10 ms count (1.99 seconds).
+const MAX_CENTISECONDS: u8 = 199;
 
 fn corrupt(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
@@ -406,6 +420,7 @@ impl FatVolume {
                             record: 0,
                             stream: None,
                             size: child.extent.size,
+                            times: child.times,
                         },
                         child.extent,
                     ));
@@ -425,6 +440,7 @@ struct Child {
     name: String,
     directory: bool,
     extent: Extent,
+    times: Times,
 }
 
 /// The allocated entries of a FAT directory, long names applied.
@@ -471,6 +487,7 @@ fn fat_entries(bytes: &[u8]) -> Vec<Child> {
                 valid: size,
                 contiguous: false,
             },
+            times: fat_times(entry),
         });
     }
     out
@@ -555,9 +572,61 @@ fn exfat_entries(bytes: &[u8]) -> Vec<Child> {
                 valid: u64_at(stream, 8).min(size),
                 contiguous: stream[1] & EXFAT_NO_FAT_CHAIN != 0,
             },
+            times: exfat_times(entry),
         });
     }
     out
+}
+
+/// The times of a FAT directory entry, all wall-clock.
+fn fat_times(entry: &[u8]) -> Times {
+    let accessed = Ts::from_dos(u16_at(entry, 18), 0)
+        .ticks()
+        .map(|midnight| Ts::from_local_ticks(midnight, Precision::Day));
+    Times {
+        created: plus_centiseconds(dos(u16_at(entry, 16), u16_at(entry, 14)), entry[13]),
+        modified: dos(u16_at(entry, 24), u16_at(entry, 22)),
+        changed: None,
+        accessed,
+    }
+}
+
+/// The times of an exFAT File entry: date and time words (the time in the
+/// low half), each with a UTC offset.
+fn exfat_times(entry: &[u8]) -> Times {
+    let stamp = |at| dos(u16_at(entry, at + 2), u16_at(entry, at));
+    Times {
+        created: in_utc(plus_centiseconds(stamp(8), entry[20]), entry[22]),
+        modified: in_utc(plus_centiseconds(stamp(12), entry[21]), entry[23]),
+        changed: None,
+        accessed: in_utc(stamp(16), entry[24]),
+    }
+}
+
+/// A date and time word pair, when it holds a time.
+fn dos(date: u16, time: u16) -> Option<Ts> {
+    known(Ts::from_dos(date, time))
+}
+
+/// `local` refined by a count of 10 ms. `common` has no 10 ms precision:
+/// milliseconds is the closest.
+fn plus_centiseconds(local: Option<Ts>, count: u8) -> Option<Ts> {
+    if count > MAX_CENTISECONDS {
+        return None;
+    }
+    let ticks = local?.ticks()? + i64::from(count) * CENTISECOND;
+    Some(Ts::from_local_ticks(ticks, Precision::Millisecond))
+}
+
+/// `local` in UTC when the exFAT offset byte says how; otherwise as is,
+/// its zone unknown.
+fn in_utc(local: Option<Ts>, offset: u8) -> Option<Ts> {
+    if offset & EXFAT_OFFSET_VALID == 0 {
+        return local;
+    }
+    // Sign-extend the 7-bit count of quarter hours.
+    let quarter_hours = i32::from((offset << 1) as i8 >> 1);
+    known(local?.assume_offset(quarter_hours * 15))
 }
 
 /// Reads a file's clusters in chain order.
@@ -594,5 +663,62 @@ impl<V: Read + Seek> Read for ChainReader<'_, V> {
         }
         self.position += n as u64;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn dos_date(year: u16, month: u16, day: u16) -> u16 {
+        ((year - 1980) << 9) | (month << 5) | day
+    }
+
+    const fn dos_time(hour: u16, minute: u16, second: u16) -> u16 {
+        (hour << 11) | (minute << 5) | (second / 2)
+    }
+
+    const DATE: u16 = dos_date(2020, 1, 1);
+    const TIME: u16 = dos_time(12, 30, 58);
+
+    fn iso(time: Option<Ts>) -> Option<String> {
+        time?.to_iso8601()
+    }
+
+    #[test]
+    fn zero_and_impossible_fat_times_are_none() {
+        let mut entry = [0u8; ENTRY];
+        assert_eq!(fat_times(&entry), Times::default());
+        entry[13] = 200; // past 1.99 s
+        entry[14..16].copy_from_slice(&TIME.to_le_bytes());
+        entry[16..18].copy_from_slice(&DATE.to_le_bytes());
+        entry[24..26].copy_from_slice(&dos_date(2020, 2, 30).to_le_bytes());
+        assert_eq!(fat_times(&entry), Times::default());
+        entry[13] = 199;
+        assert_eq!(
+            iso(fat_times(&entry).created).as_deref(),
+            Some("2020-01-01T12:30:59.9900000")
+        );
+    }
+
+    #[test]
+    fn exfat_offsets_are_signed_quarter_hours() {
+        let local = dos(DATE, TIME);
+        let utc = |offset| iso(in_utc(local, offset));
+        // +01:00, -00:15, -16:00, then an offset not marked valid.
+        assert_eq!(
+            utc(0x80 | 4).as_deref(),
+            Some("2020-01-01T11:30:58.0000000Z")
+        );
+        assert_eq!(
+            utc(0x80 | 0x7f).as_deref(),
+            Some("2020-01-01T12:45:58.0000000Z")
+        );
+        assert_eq!(
+            utc(0x80 | 0x40).as_deref(),
+            Some("2020-01-02T04:30:58.0000000Z")
+        );
+        assert_eq!(utc(0x04).as_deref(), Some("2020-01-01T12:30:58.0000000"));
+        assert_eq!(in_utc(None, 0x84), None);
     }
 }

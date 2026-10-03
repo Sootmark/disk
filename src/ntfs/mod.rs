@@ -21,6 +21,7 @@ use reader::{CompressedReader, Extents, StreamReader};
 use record::{flags, kind, Attribute, Body, FileName, Record, DOS_NAMESPACE};
 
 use crate::partition::read_at;
+use crate::times::Times;
 use crate::window::Window;
 
 /// Record number of the root directory.
@@ -45,6 +46,8 @@ pub struct FileEntry {
     /// `$UsnJrnl:$J`) legitimately declare far more than they store, and a
     /// corrupt record can declare anything: bound what you read.
     pub size: u64,
+    /// The file's times (an alternate data stream has its file's).
+    pub times: Times,
 }
 
 impl FileEntry {
@@ -215,6 +218,7 @@ impl NtfsVolume {
 struct Node {
     sequence: u16,
     is_directory: bool,
+    times: Times,
     names: Vec<FileName>,
     /// Attribute lists: the base record's, then each extension record's.
     attribute_sets: Vec<Vec<Attribute>>,
@@ -225,12 +229,25 @@ impl From<Record> for Node {
         let mut node = Self {
             sequence: record.sequence,
             is_directory: record.is_directory,
+            times: times_of(&record.attributes),
             names: Vec::new(),
             attribute_sets: Vec::new(),
         };
         node.merge_extension(record.attributes);
         node
     }
+}
+
+/// The times in a base record's `$STANDARD_INFORMATION` (always resident).
+fn times_of(attributes: &[Attribute]) -> Times {
+    attributes
+        .iter()
+        .filter(|a| a.kind == kind::STANDARD_INFORMATION)
+        .find_map(|a| match &a.body {
+            Body::Resident(value) => record::standard_information(value).ok(),
+            Body::NonResident { .. } => None,
+        })
+        .unwrap_or_default()
 }
 
 impl Node {
@@ -299,6 +316,7 @@ fn build_index(nodes: &BTreeMap<u64, Node>) -> Index {
                 record: number,
                 stream: (!name.is_empty()).then(|| name.clone()),
                 size,
+                times: node.times,
             });
             streams.insert((number, name), stream);
         }

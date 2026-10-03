@@ -143,6 +143,37 @@ fn content_matches_icat() {
     assert_eq!(by_path(r"Users\Public\rclone.exe").size, 6_000);
 }
 
+/// `$STANDARD_INFORMATION` times, as `istat` reads them: m64.exe's are
+/// timestomped to 2019 (its `$FILE_NAME` keeps 2026), and tools.zip's are
+/// its Zone.Identifier stream's too.
+#[test]
+fn times_match_istat() {
+    let (mut disk, length) = image();
+    let volume = ntfs_volume(&mut disk, length);
+    let files = volume.files(&mut disk).unwrap();
+    let times = |path: &str| {
+        let times = files
+            .iter()
+            .find(|f| f.display_path() == path)
+            .unwrap_or_else(|| panic!("{path} listed"))
+            .times;
+        [times.created, times.modified, times.changed, times.accessed]
+            .map(|t| t.and_then(|t| t.to_iso8601()).unwrap())
+    };
+    assert_eq!(
+        times(r"ProgramData\Intel\m64.exe"),
+        ["2019-03-18T04:12:00.0000000Z"; 4]
+    );
+    let downloaded = "2026-09-14T10:04:37.2819446Z";
+    let finished = "2026-09-14T10:04:39.0120071Z";
+    for path in [
+        r"Users\svc_backup\Downloads\tools.zip",
+        r"Users\svc_backup\Downloads\tools.zip:Zone.Identifier",
+    ] {
+        assert_eq!(times(path), [downloaded, finished, finished, finished]);
+    }
+}
+
 #[test]
 fn split_images_read_like_the_whole_image() {
     let dir = std::env::temp_dir().join(format!("disk-split-{}", std::process::id()));
