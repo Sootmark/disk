@@ -29,3 +29,6 @@ pub use partition::{partitions, Partition, PartitionType, Scheme, SECTOR_SIZE};
 pub use split::SplitImage;
 pub use times::Times;
 pub use window::Window;
+
+/// This crate's version, for records of what parsed them.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
