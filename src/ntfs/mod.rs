@@ -1,5 +1,5 @@
 //! NTFS volumes, read from scratch: list allocated files (with alternate
-//! data streams) and stream their content.
+//! data streams) and stream their content; and loose `$MFT` files.
 //!
 //! The MFT is walked record by record, the way forensic MFT parsers do:
 //! paths are rebuilt from each record's `$FILE_NAME` parent reference, and
@@ -8,30 +8,26 @@
 
 mod boot;
 mod lznt1;
+mod mft;
 mod reader;
 mod record;
 mod runs;
+mod table;
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Read, Seek};
 
 use boot::Boot;
 use reader::{CompressedReader, Extents, StreamReader};
-use record::{flags, kind, Attribute, Body, FileName, Record, DOS_NAMESPACE};
+use record::{flags, kind, Attribute, Body};
+use table::{Table, ROOT_RECORD};
+
+pub use mft::{DataStream, FileName, Mft, MftFile, MftProblem, Namespace};
 
 use crate::partition::read_at;
 use crate::times::Times;
 use crate::window::Window;
-
-/// Record number of the root directory.
-const ROOT_RECORD: u64 = 5;
-/// Upper bound on records scanned (hostile MFT sizes).
-const MAX_RECORDS: u64 = 64 * 1024 * 1024;
-/// Upper bound on path depth (cycles in hostile parent references).
-const MAX_DEPTH: usize = 256;
-/// Where files whose parent is gone are placed, as The Sleuth Kit does.
-const ORPHANS: &str = "$OrphanFiles";
 
 /// One file, or one alternate data stream of a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +99,12 @@ impl NtfsVolume {
         let mft_record = record::parse(&mut first)
             .map_err(invalid_data)?
             .ok_or_else(|| corrupt("$MFT record"))?;
-        let Stream::NonResident(mft) = stream_of(&[mft_record.attributes.as_slice()], "") else {
+        let default_data = mft_record
+            .attributes
+            .iter()
+            .filter(|a| a.kind == kind::DATA && a.name.is_empty())
+            .collect();
+        let Stream::NonResident(mft) = stream_of(default_data) else {
             return Err(corrupt("$MFT data"));
         };
         Ok(Self {
@@ -175,185 +176,61 @@ impl NtfsVolume {
         Ok(self.index.get_or_init(|| index))
     }
 
-    /// Walk the MFT once: collect in-use records, merge extension records,
-    /// rebuild paths.
+    /// Every file record of the volume's MFT, deleted ones included: what
+    /// [`Mft::read`] gives for the volume's `$MFT` copied out.
+    ///
+    /// # Errors
+    /// On read errors.
+    pub fn mft<R: Read + Seek>(&self, disk: &mut R) -> io::Result<Mft> {
+        Ok(Mft::from_table(self.table(disk)?))
+    }
+
+    /// Walk the MFT once.
     fn scan<R: Read + Seek>(&self, disk: &mut R) -> io::Result<Index> {
+        Ok(build_index(&self.table(disk)?))
+    }
+
+    fn table<R: Read + Seek>(&self, disk: &mut R) -> io::Result<Table> {
         let mut volume = Window::new(disk, self.start, self.length);
-        let mut mft = StreamReader::new(&mut volume, &self.mft, self.boot.cluster_size);
-        let record_size = self.boot.record_size;
-        let count = (self.mft.real_size / record_size).min(MAX_RECORDS);
-        let mut nodes: BTreeMap<u64, Node> = BTreeMap::new();
-        // Ordered maps keep merging deterministic (hard links across
-        // extension records would otherwise pick names in random order).
-        let mut extensions: BTreeMap<u64, Vec<Vec<Attribute>>> = BTreeMap::new();
-        let mut buffer = vec![0u8; record_size as usize];
-        for number in 0..count {
-            mft.read_exact(&mut buffer)?;
-            // Corrupt records (torn writes, bad structure) are skipped.
-            let Ok(Some(record)) = record::parse(&mut buffer) else {
-                continue;
-            };
-            if !record.in_use {
-                continue;
-            }
-            match record.base {
-                Some(base) => extensions.entry(base).or_default().push(record.attributes),
-                None => {
-                    nodes.insert(number, Node::from(record));
-                }
-            }
-        }
-        for (base, attribute_sets) in extensions {
-            if let Some(node) = nodes.get_mut(&base) {
-                for attributes in attribute_sets {
-                    node.merge_extension(attributes);
-                }
-            }
-        }
-        Ok(build_index(&nodes))
+        let mft = StreamReader::new(&mut volume, &self.mft, self.boot.cluster_size);
+        Table::read(mft, self.boot.record_size as usize)
     }
 }
 
-/// What the scan keeps of each in-use base record.
-struct Node {
-    sequence: u16,
-    is_directory: bool,
-    times: Times,
-    names: Vec<FileName>,
-    /// Attribute lists: the base record's, then each extension record's.
-    attribute_sets: Vec<Vec<Attribute>>,
-}
-
-impl From<Record> for Node {
-    fn from(record: Record) -> Self {
-        let mut node = Self {
-            sequence: record.sequence,
-            is_directory: record.is_directory,
-            times: times_of(&record.attributes),
-            names: Vec::new(),
-            attribute_sets: Vec::new(),
-        };
-        node.merge_extension(record.attributes);
-        node
-    }
-}
-
-/// The times in a base record's `$STANDARD_INFORMATION` (always resident).
-fn times_of(attributes: &[Attribute]) -> Times {
-    attributes
-        .iter()
-        .filter(|a| a.kind == kind::STANDARD_INFORMATION)
-        .find_map(|a| match &a.body {
-            Body::Resident(value) => record::standard_information(value).ok(),
-            Body::NonResident { .. } => None,
-        })
-        .unwrap_or_default()
-}
-
-impl Node {
-    fn merge_extension(&mut self, attributes: Vec<Attribute>) {
-        self.names.extend(
-            attributes
-                .iter()
-                .filter(|a| a.kind == kind::FILE_NAME)
-                .filter_map(|a| match &a.body {
-                    Body::Resident(value) => record::file_name(value).ok(),
-                    Body::NonResident { .. } => None,
-                }),
-        );
-        self.attribute_sets.push(
-            attributes
-                .into_iter()
-                .filter(|a| a.kind == kind::DATA)
-                .collect(),
-        );
-    }
-
-    /// The long name (8.3 aliases only as a last resort).
-    fn primary_name(&self) -> Option<&FileName> {
-        self.names
-            .iter()
-            .find(|n| n.namespace != DOS_NAMESPACE)
-            .or_else(|| self.names.first())
-    }
-
-    fn stream_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .attribute_sets
-            .iter()
-            .flatten()
-            .map(|a| a.name.clone())
-            .collect();
-        names.sort();
-        names.dedup();
-        names
-    }
-}
-
-fn build_index(nodes: &BTreeMap<u64, Node>) -> Index {
+/// The in-use files and their streams. Corrupt records are left out.
+fn build_index(table: &Table) -> Index {
     let mut files = Vec::new();
     let mut streams = HashMap::new();
-    for (&number, node) in nodes {
+    for (&number, node) in table.nodes.iter().filter(|(_, node)| node.in_use) {
         if number == ROOT_RECORD {
             continue;
         }
-        let Some(path) = path_of(nodes, number) else {
+        let Some(path) = table.path_of(number) else {
             continue;
         };
         for name in node.stream_names() {
             if node.is_directory && name.is_empty() {
                 continue;
             }
-            let sets: Vec<&[Attribute]> = node.attribute_sets.iter().map(Vec::as_slice).collect();
-            let stream = stream_of(&sets, &name);
-            let size = match &stream {
-                Stream::Resident(bytes) => bytes.len() as u64,
-                Stream::NonResident(extents) | Stream::Compressed(extents, _) => extents.real_size,
-                Stream::Unsupported(_) => declared_size(&sets, &name),
-            };
             files.push(FileEntry {
                 path: path.clone(),
                 record: number,
-                stream: (!name.is_empty()).then(|| name.clone()),
-                size,
-                times: node.times,
+                stream: (!name.is_empty()).then(|| name.to_owned()),
+                size: node.stream_size(name),
+                times: node.times.unwrap_or_default(),
             });
-            streams.insert((number, name), stream);
+            streams.insert(
+                (number, name.to_owned()),
+                stream_of(node.pieces(name).collect()),
+            );
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.stream.cmp(&b.stream)));
     Index { files, streams }
 }
 
-/// The path of `number` from the root, or under [`ORPHANS`] when its parent
-/// chain is broken (parent reused, gone, or cyclic).
-fn path_of(nodes: &BTreeMap<u64, Node>, number: u64) -> Option<Vec<String>> {
-    let mut components = Vec::new();
-    let mut seen = HashSet::new();
-    let mut current = number;
-    while current != ROOT_RECORD {
-        let name = nodes.get(&current)?.primary_name()?;
-        components.push(name.name.clone());
-        let parent_ok = nodes
-            .get(&name.parent)
-            .is_some_and(|p| p.is_directory && p.sequence == name.parent_sequence);
-        if !parent_ok || !seen.insert(current) || components.len() > MAX_DEPTH {
-            components.push(ORPHANS.to_owned());
-            break;
-        }
-        current = name.parent;
-    }
-    components.reverse();
-    Some(components)
-}
-
-/// Assemble the `$DATA` attribute named `name` from its pieces.
-fn stream_of(sets: &[&[Attribute]], name: &str) -> Stream {
-    let mut pieces: Vec<&Attribute> = sets
-        .iter()
-        .flat_map(|set| set.iter())
-        .filter(|a| a.kind == kind::DATA && a.name == name)
-        .collect();
+/// Assemble a `$DATA` stream from its pieces.
+fn stream_of(mut pieces: Vec<&Attribute>) -> Stream {
     if pieces.iter().any(|a| a.flags & flags::ENCRYPTED != 0) {
         return Stream::Unsupported("encrypted (EFS) stream");
     }
@@ -398,22 +275,6 @@ fn stream_of(sets: &[&[Attribute]], name: &str) -> Stream {
         1..=8 => Stream::Compressed(extents, 1 << unit),
         _ => Stream::Unsupported("compressed stream with an unusual compression unit"),
     }
-}
-
-fn declared_size(sets: &[&[Attribute]], name: &str) -> u64 {
-    sets.iter()
-        .flat_map(|set| set.iter())
-        .filter(|a| a.kind == kind::DATA && a.name == name)
-        .find_map(|a| match &a.body {
-            Body::Resident(bytes) => Some(bytes.len() as u64),
-            Body::NonResident {
-                first_vcn: 0,
-                real_size,
-                ..
-            } => Some(*real_size),
-            Body::NonResident { .. } => None,
-        })
-        .unwrap_or(0)
 }
 
 fn corrupt(what: &'static str) -> io::Error {

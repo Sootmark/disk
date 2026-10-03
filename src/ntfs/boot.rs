@@ -8,7 +8,7 @@ const GEOMETRY_OFFSET: usize = 0x0b;
 const TOTAL_SECTORS_OFFSET: usize = 0x28;
 /// Upper bounds that reject nonsense geometry from hostile images.
 const MAX_CLUSTER_SIZE: u64 = 2 << 20;
-const MAX_RECORD_SIZE: u64 = 64 * 1024;
+pub(crate) const MAX_RECORD_SIZE: u64 = 64 * 1024;
 
 /// Geometry read from the boot sector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

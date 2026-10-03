@@ -117,3 +117,54 @@ mod fat {
         }
     }
 }
+
+mod mft {
+    use std::sync::OnceLock;
+
+    use proptest::prelude::*;
+    use sootmark_disk::Mft;
+
+    fn loose() -> &'static [u8] {
+        static MFT: OnceLock<Vec<u8>> = OnceLock::new();
+        MFT.get_or_init(|| {
+            let path = format!(
+                "{}/tests/fixtures/mft/deleted.mft.zlib",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            common::deflate::zlib_decompress(&std::fs::read(path).unwrap(), 1 << 20).unwrap()
+        })
+    }
+
+    /// Read everything, paths included; only a panic (or a hang) fails.
+    fn walk(bytes: &[u8]) {
+        for file in Mft::parse(bytes).files {
+            let _ = file.display_path();
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            walk(&bytes);
+        }
+
+        /// Records, attributes, names and parent references corrupted, and
+        /// the end cut anywhere.
+        #[test]
+        fn corrupted_mft_never_panics(
+            flips in proptest::collection::vec((0usize..88 * 1024, any::<u8>()), 1..64),
+            cut in 0usize..88 * 1024,
+        ) {
+            let mut bytes = loose().to_vec();
+            for (at, value) in flips {
+                if let Some(byte) = bytes.get_mut(at) {
+                    *byte = value;
+                }
+            }
+            bytes.truncate(cut.max(1024));
+            walk(&bytes);
+        }
+    }
+}

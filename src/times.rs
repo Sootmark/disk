@@ -7,7 +7,7 @@ use common::time::Ts;
 /// or impossible.
 ///
 /// NTFS times are UTC, from `$STANDARD_INFORMATION` (what Windows shows,
-/// and what timestomping rewrites). FAT times are wall-clock times in an
+/// and what timestomping rewrites), or a [`FileName`](crate::FileName)'s own. FAT times are wall-clock times in an
 /// unknown zone; exFAT times are UTC when they record their offset, and
 /// wall-clock otherwise. [`Ts::semantic`] tells which.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

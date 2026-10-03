@@ -4,10 +4,14 @@ use common::bytes::{Error, ErrorKind, Reader, Result};
 use common::text;
 use common::time::Ts;
 
+use super::mft::{FileName, Namespace};
 use super::runs::{self, Run};
 use crate::times::{known, Times};
 
 const FILE_SIGNATURE: &[u8; 4] = b"FILE";
+/// What Windows writes over a record whose fixups failed.
+const BAD_SIGNATURE: &[u8; 4] = b"BAAD";
+const ALLOCATED_SIZE_OFFSET: usize = 0x1c;
 /// Fixups protect the last two bytes of every 512-byte stride.
 const FIXUP_STRIDE: usize = 512;
 const IN_USE: u16 = 0x0001;
@@ -35,8 +39,9 @@ pub(crate) struct Record {
     pub(crate) in_use: bool,
     pub(crate) is_directory: bool,
     pub(crate) sequence: u16,
-    /// For extension records, the base record they belong to.
-    pub(crate) base: Option<u64>,
+    /// For extension records, the base record they belong to: its record
+    /// number and sequence number.
+    pub(crate) base: Option<(u64, u16)>,
     pub(crate) attributes: Vec<Attribute>,
 }
 
@@ -76,11 +81,26 @@ pub(crate) const fn reference_sequence(reference: u64) -> u16 {
     (reference >> 48) as u16
 }
 
+/// The size a record declares for itself (its allocated size), when
+/// `bytes` starts with one.
+pub(crate) fn declared_size(bytes: &[u8]) -> Option<usize> {
+    if bytes.get(..4) != Some(FILE_SIGNATURE.as_slice()) {
+        return None;
+    }
+    let mut r = Reader::new(bytes);
+    r.seek(ALLOCATED_SIZE_OFFSET).ok()?;
+    r.u32_le().ok().map(|size| size as usize)
+}
+
 /// Parse a record in place (fixups are applied to `buffer`). `Ok(None)` for
 /// slots that don't hold a record (never used, or zeroed).
 pub(crate) fn parse(buffer: &mut [u8]) -> Result<Option<Record>> {
-    if buffer.get(..4) != Some(FILE_SIGNATURE.as_slice()) {
-        return Ok(None);
+    match buffer.get(..4) {
+        Some(signature) if signature == FILE_SIGNATURE => {}
+        Some(signature) if signature == BAD_SIGNATURE => {
+            return Err(invalid(0, "a record Windows didn't mark bad (BAAD)"));
+        }
+        _ => return Ok(None),
     }
     apply_fixups(buffer)?;
     let mut r = Reader::new(buffer);
@@ -97,7 +117,12 @@ pub(crate) fn parse(buffer: &mut [u8]) -> Result<Option<Record>> {
         in_use: record_flags & IN_USE != 0,
         is_directory: record_flags & DIRECTORY != 0,
         sequence,
-        base: (base_reference != 0).then(|| record_number(base_reference)),
+        base: (base_reference != 0).then(|| {
+            (
+                record_number(base_reference),
+                reference_sequence(base_reference),
+            )
+        }),
         attributes,
     }))
 }
@@ -203,38 +228,38 @@ fn invalid(offset: usize, expected: &'static str) -> Error {
     }
 }
 
-/// A `$FILE_NAME` value: the parent reference, name and namespace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileName {
-    pub(crate) parent: u64,
-    pub(crate) parent_sequence: u16,
-    pub(crate) name: String,
-    pub(crate) namespace: u8,
-}
-
-/// Namespace of 8.3 short names, which duplicate a long name.
-pub(crate) const DOS_NAMESPACE: u8 = 2;
 const FILE_NAME_LENGTH_OFFSET: usize = 0x40;
 
+/// A `$FILE_NAME` value: the parent reference, four times, two sizes, then
+/// the name.
 pub(crate) fn file_name(value: &[u8]) -> Result<FileName> {
     let mut r = Reader::new(value);
     let parent_reference = r.u64_le()?;
+    let times = filetimes(&mut r)?;
+    let allocated_size = r.u64_le()?;
+    let size = r.u64_le()?;
     r.seek(FILE_NAME_LENGTH_OFFSET)?;
     let length = usize::from(r.u8()?);
-    let namespace = r.u8()?;
+    let namespace = Namespace::from_code(r.u8()?);
     let name = text::utf16le(r.bytes(length * 2)?).text;
     Ok(FileName {
-        parent: record_number(parent_reference),
-        parent_sequence: reference_sequence(parent_reference),
         name,
         namespace,
+        parent: record_number(parent_reference),
+        parent_sequence: reference_sequence(parent_reference),
+        times,
+        allocated_size,
+        size,
     })
 }
 
-/// The times of a `$STANDARD_INFORMATION` value: four FILETIMEs (created,
-/// modified, MFT entry changed, accessed).
+/// The times of a `$STANDARD_INFORMATION` value.
 pub(crate) fn standard_information(value: &[u8]) -> Result<Times> {
-    let mut r = Reader::new(value);
+    filetimes(&mut Reader::new(value))
+}
+
+/// Four FILETIMEs in a row: created, modified, MFT entry changed, accessed.
+fn filetimes(r: &mut Reader) -> Result<Times> {
     let mut next = || {
         r.u64_le()
             .map(|filetime| known(Ts::from_filetime(filetime)))
