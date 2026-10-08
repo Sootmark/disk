@@ -11,6 +11,9 @@
 //! Deleted entries aren't listed. Every chain is bounded by the volume's
 //! cluster count, so a looping FAT ends a file early instead of hanging.
 //!
+//! Each directory is also a stream of its own: its entries as stored, for
+//! readers of the entries themselves ([`DirectoryFormat::entries`]).
+//!
 //! Times are MS-DOS date and time words: wall-clock, to 2 seconds, with a
 //! 10 ms refinement for creation (and exFAT's modification), and a date
 //! alone for FAT's last access. exFAT adds a UTC offset to each.
@@ -88,6 +91,86 @@ pub enum FatKind {
     ExFat,
 }
 
+impl FatKind {
+    /// How the volume's directories lay out their entries.
+    #[must_use]
+    pub const fn directory_format(self) -> DirectoryFormat {
+        match self {
+            Self::Fat12 | Self::Fat16 | Self::Fat32 => DirectoryFormat::Fat,
+            Self::ExFat => DirectoryFormat::ExFat,
+        }
+    }
+}
+
+/// How a directory lays out its entries: FAT12, FAT16 and FAT32 share one
+/// format, exFAT has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryFormat {
+    /// 32-byte entries with an 8.3 name, each preceded by the long-name
+    /// entries its name needs.
+    Fat,
+    /// Entry sets: a File entry, a Stream Extension, File Name entries.
+    ExFat,
+}
+
+impl DirectoryFormat {
+    /// The stream name a directory of this format is listed under
+    /// ([`FatVolume::directories`]).
+    #[must_use]
+    pub const fn stream(self) -> &'static str {
+        match self {
+            Self::Fat => "$FAT_DIRECTORY",
+            Self::ExFat => "$EXFAT_DIRECTORY",
+        }
+    }
+
+    /// The format of a directory listed under `stream`.
+    #[must_use]
+    pub fn of_stream(stream: &str) -> Option<Self> {
+        [Self::Fat, Self::ExFat]
+            .into_iter()
+            .find(|format| format.stream() == stream)
+    }
+
+    /// The files and folders a directory of this format lists, in the
+    /// order it stores them; `.`, `..`, the volume label and deleted
+    /// entries left out.
+    #[must_use]
+    pub fn entries(self, directory: &[u8]) -> Vec<DirectoryEntry> {
+        self.children(directory)
+            .into_iter()
+            .map(|child| child.entry)
+            .collect()
+    }
+
+    /// The entries, each with where its content is.
+    fn children(self, directory: &[u8]) -> Vec<Child> {
+        match self {
+            Self::Fat => fat_entries(directory),
+            Self::ExFat => exfat_entries(directory),
+        }
+    }
+}
+
+/// A file or folder, as its directory lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    /// Byte offset in the directory of the entry holding its times: the
+    /// 8.3 entry (after its long-name entries), or exFAT's File entry.
+    pub offset: u64,
+    /// Its name: the long name when there is one.
+    pub name: String,
+    /// Whether it is a folder.
+    pub is_directory: bool,
+    /// FAT's attribute byte, or exFAT's file attributes: read-only 0x01,
+    /// hidden 0x02, system 0x04, folder 0x10, archive 0x20.
+    pub attributes: u16,
+    /// Size in bytes; 0 for a FAT folder, which records none.
+    pub size: u64,
+    /// Its times.
+    pub times: Times,
+}
+
 /// Where a file's content is.
 #[derive(Debug, Clone, Copy)]
 struct Extent {
@@ -117,6 +200,19 @@ pub struct FatVolume {
     root_cluster: u32,
     /// Every allocated file, and where its content is (same order).
     files: Vec<(FileEntry, Extent)>,
+    /// Every directory, and where its entries are (same order).
+    directories: Vec<(FileEntry, Directory)>,
+}
+
+/// Where a directory's entries are.
+#[derive(Debug, Clone, Copy)]
+struct Directory {
+    /// 0 for the fixed root region of FAT12 and FAT16.
+    first_cluster: u32,
+    /// The clusters follow each other, without the FAT (exFAT).
+    contiguous: bool,
+    /// Bytes, when recorded (exFAT); a FAT directory ends with its chain.
+    size: Option<u64>,
 }
 
 impl FatVolume {
@@ -139,7 +235,7 @@ impl FatVolume {
         volume.cluster_count = volume
             .cluster_count
             .min(u32::try_from(fits).unwrap_or(u32::MAX));
-        volume.files = volume.list(disk)?;
+        (volume.files, volume.directories) = volume.list(disk)?;
         Ok(volume)
     }
 
@@ -200,6 +296,7 @@ impl FatVolume {
                 0
             },
             files: Vec::new(),
+            directories: Vec::new(),
         })
     }
 
@@ -221,6 +318,7 @@ impl FatVolume {
             fixed_root: None,
             root_cluster: u32_at(boot, 96),
             files: Vec::new(),
+            directories: Vec::new(),
         })
     }
 
@@ -237,7 +335,22 @@ impl FatVolume {
         self.files.iter().map(|(entry, _)| entry.clone()).collect()
     }
 
-    /// Stream the content of `entry` into `consume`.
+    /// Every directory, the root's included (with an empty path), sorted
+    /// by path: a stream of its entries as stored, deleted ones and the
+    /// slack after the last included, named after its
+    /// [`DirectoryFormat`]. Listed apart from the files so a file listing
+    /// stays one; `record` is the directory's index in this listing, and
+    /// `times` its own (none for the root, which no entry lists).
+    #[must_use]
+    pub fn directories(&self) -> Vec<FileEntry> {
+        self.directories
+            .iter()
+            .map(|(entry, _)| entry.clone())
+            .collect()
+    }
+
+    /// Stream the content of `entry`, a file or a directory, into
+    /// `consume`.
     ///
     /// # Errors
     /// When the entry isn't one of this volume's, or its clusters can't be
@@ -248,10 +361,17 @@ impl FatVolume {
         entry: &FileEntry,
         consume: &mut dyn FnMut(&mut dyn Read) -> io::Result<()>,
     ) -> io::Result<()> {
-        let (_, extent) = usize::try_from(entry.record)
-            .ok()
-            .and_then(|i| self.files.get(i))
-            .ok_or_else(|| corrupt("no such file on this volume"))?;
+        let missing = || corrupt("no such file on this volume");
+        let index = usize::try_from(entry.record).map_err(|_| missing())?;
+        let (_, extent) = match entry.kind {
+            StreamKind::Data => self.files.get(index).ok_or_else(missing)?,
+            StreamKind::Directory => {
+                let (_, directory) = self.directories.get(index).ok_or_else(missing)?;
+                let entries = self.directory(disk, *directory)?;
+                return consume(&mut entries.as_slice());
+            }
+            StreamKind::DirectoryIndex => return Err(missing()),
+        };
         let clusters = self.chain(disk, extent.first_cluster, extent.contiguous, extent.size)?;
         let mut volume = Window::new(disk, self.start, self.length);
         let mut reader = ChainReader {
@@ -331,13 +451,12 @@ impl FatVolume {
     }
 
     /// The bytes of a directory: the fixed root region, or its clusters.
-    fn directory<R: Read + Seek>(
-        &self,
-        disk: &mut R,
-        first: u32,
-        contiguous: bool,
-        size: Option<u64>,
-    ) -> io::Result<Vec<u8>> {
+    fn directory<R: Read + Seek>(&self, disk: &mut R, at: Directory) -> io::Result<Vec<u8>> {
+        let Directory {
+            first_cluster: first,
+            contiguous,
+            size,
+        } = at;
         if first == 0 {
             if let Some((offset, bytes)) = self.fixed_root {
                 let mut data = vec![0; bytes as usize];
@@ -381,38 +500,56 @@ impl FatVolume {
         Ok(clusters)
     }
 
-    /// Walk the directory tree from the root.
-    fn list<R: Read + Seek>(&self, disk: &mut R) -> io::Result<Vec<(FileEntry, Extent)>> {
+    /// Walk the directory tree from the root: its files, and its
+    /// directories.
+    fn list<R: Read + Seek>(&self, disk: &mut R) -> io::Result<Listing> {
         let mut files = Vec::new();
+        let mut directories = Vec::new();
         let mut entries = 0;
-        // The root has no recorded size in either variant: its chain ends it.
-        let root = (self.root_cluster, false, None);
-        let mut pending = vec![(Vec::<String>::new(), root)];
+        let format = self.kind.directory_format();
+        // The root has no recorded size in either variant: its chain ends
+        // it. No entry lists it, so it has no times.
+        let root = Directory {
+            first_cluster: self.root_cluster,
+            contiguous: false,
+            size: None,
+        };
+        let mut pending = vec![(Vec::<String>::new(), root, Times::default())];
         let mut visited = HashSet::new();
-        while let Some((path, (first, contiguous, size))) = pending.pop() {
+        while let Some((path, directory, times)) = pending.pop() {
+            let first = directory.first_cluster;
             if path.len() > MAX_DEPTH || (first != 0 && !visited.insert(first)) {
                 continue;
             }
-            let Ok(bytes) = self.directory(disk, first, contiguous, size) else {
+            let Ok(bytes) = self.directory(disk, directory) else {
                 continue;
             };
-            let children = match self.kind {
-                FatKind::ExFat => exfat_entries(&bytes),
-                _ => fat_entries(&bytes),
-            };
-            for child in children {
+            let children = format.children(&bytes);
+            directories.push((
+                FileEntry {
+                    path: path.clone(),
+                    record: 0,
+                    stream: Some(format.stream().to_owned()),
+                    kind: StreamKind::Directory,
+                    size: bytes.len() as u64,
+                    times,
+                },
+                directory,
+            ));
+            for Child { entry, extent } in children {
                 entries += 1;
                 if entries > MAX_ENTRIES {
                     return Err(corrupt("more directory entries than a volume holds"));
                 }
                 let mut child_path = path.clone();
-                child_path.push(child.name);
-                if child.directory {
-                    let size = (self.kind == FatKind::ExFat).then_some(child.extent.size);
-                    pending.push((
-                        child_path,
-                        (child.extent.first_cluster, child.extent.contiguous, size),
-                    ));
+                child_path.push(entry.name);
+                if entry.is_directory {
+                    let directory = Directory {
+                        first_cluster: extent.first_cluster,
+                        contiguous: extent.contiguous,
+                        size: (format == DirectoryFormat::ExFat).then_some(extent.size),
+                    };
+                    pending.push((child_path, directory, entry.times));
                 } else {
                     files.push((
                         FileEntry {
@@ -420,35 +557,41 @@ impl FatVolume {
                             record: 0,
                             stream: None,
                             kind: StreamKind::Data,
-                            size: child.extent.size,
-                            times: child.times,
+                            size: extent.size,
+                            times: entry.times,
                         },
-                        child.extent,
+                        extent,
                     ));
                 }
             }
         }
-        files.sort_by(|a, b| a.0.path.cmp(&b.0.path));
-        for (index, (entry, _)) in files.iter_mut().enumerate() {
-            entry.record = index as u64;
-        }
-        Ok(files)
+        Ok((sorted(files), sorted(directories)))
     }
 }
 
-/// A directory entry, decoded.
+/// A volume's files and directories, each with where its bytes are.
+type Listing = (Vec<(FileEntry, Extent)>, Vec<(FileEntry, Directory)>);
+
+/// `entries` sorted by path, each numbered by its place.
+fn sorted<T>(mut entries: Vec<(FileEntry, T)>) -> Vec<(FileEntry, T)> {
+    entries.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    for (index, (entry, _)) in entries.iter_mut().enumerate() {
+        entry.record = index as u64;
+    }
+    entries
+}
+
+/// A directory entry, decoded, and where its content is.
 struct Child {
-    name: String,
-    directory: bool,
+    entry: DirectoryEntry,
     extent: Extent,
-    times: Times,
 }
 
 /// The allocated entries of a FAT directory, long names applied.
 fn fat_entries(bytes: &[u8]) -> Vec<Child> {
     let mut out = Vec::new();
     let mut long: Vec<(u8, Vec<u16>)> = Vec::new();
-    for entry in bytes.chunks_exact(ENTRY) {
+    for (index, entry) in bytes.chunks_exact(ENTRY).enumerate() {
         match entry[0] {
             0 => break,
             DELETED => {
@@ -480,15 +623,20 @@ fn fat_entries(bytes: &[u8]) -> Vec<Child> {
         let first_cluster = u32::from(u16_at(entry, 20)) << 16 | u32::from(u16_at(entry, 26));
         let size = u64::from(u32_at(entry, 28));
         out.push(Child {
-            name,
-            directory: attributes & ATTR_DIRECTORY != 0,
+            entry: DirectoryEntry {
+                offset: (index * ENTRY) as u64,
+                name,
+                is_directory: attributes & ATTR_DIRECTORY != 0,
+                attributes: u16::from(attributes),
+                size,
+                times: fat_times(entry),
+            },
             extent: Extent {
                 first_cluster,
                 size,
                 valid: size,
                 contiguous: false,
             },
-            times: fat_times(entry),
         });
     }
     out
@@ -546,6 +694,7 @@ fn exfat_entries(bytes: &[u8]) -> Vec<Child> {
             i += 1;
             continue;
         }
+        let offset = (i * ENTRY) as u64;
         let secondaries = usize::from(entry[1]);
         let set = &entries[i + 1..(i + 1 + secondaries).min(entries.len())];
         i += 1 + secondaries;
@@ -564,16 +713,22 @@ fn exfat_entries(bytes: &[u8]) -> Vec<Child> {
             .take(name_length)
             .collect();
         let size = u64_at(stream, 24);
+        let attributes = u16_at(entry, 4);
         out.push(Child {
-            name: String::from_utf16_lossy(&units),
-            directory: u16_at(entry, 4) & u16::from(ATTR_DIRECTORY) != 0,
+            entry: DirectoryEntry {
+                offset,
+                name: String::from_utf16_lossy(&units),
+                is_directory: attributes & u16::from(ATTR_DIRECTORY) != 0,
+                attributes,
+                size,
+                times: exfat_times(entry),
+            },
             extent: Extent {
                 first_cluster: u32_at(stream, 20),
                 size,
                 valid: u64_at(stream, 8).min(size),
                 contiguous: stream[1] & EXFAT_NO_FAT_CHAIN != 0,
             },
-            times: exfat_times(entry),
         });
     }
     out

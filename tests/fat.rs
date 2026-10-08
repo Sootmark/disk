@@ -1,12 +1,13 @@
 //! FAT12, FAT16, FAT32 and exFAT volumes (`tests/fixtures/fat/`) against
 //! The Sleuth Kit's reading of them: the same allocated files, each with
-//! the same content.
+//! the same content. Each directory's entries, read back from its stream,
+//! list the same files and folders.
 
 use std::io::{Cursor, Read};
 use std::path::Path;
 
 use common::sha256::Sha256;
-use sootmark_disk::{FatKind, FatVolume};
+use sootmark_disk::{DirectoryFormat, FatKind, FatVolume, FileEntry, StreamKind, Times};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(
@@ -17,12 +18,17 @@ fn fixture(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
-fn listing(volume: &str) -> Vec<(String, String)> {
+fn open(volume: &str) -> (Cursor<Vec<u8>>, FatVolume) {
     let image = common::deflate::zlib_decompress(&fixture(&format!("{volume}.img.zlib")), 64 << 20)
         .unwrap();
     let length = image.len() as u64;
     let mut disk = Cursor::new(image);
     let fat = FatVolume::open(&mut disk, 0, length).unwrap();
+    (disk, fat)
+}
+
+fn listing(volume: &str) -> Vec<(String, String)> {
+    let (mut disk, fat) = open(volume);
     let mut out: Vec<(String, String)> = fat
         .files()
         .iter()
@@ -82,6 +88,76 @@ fn every_variant_reads_as_the_sleuth_kit_reads_it() {
         );
         assert_eq!(ours, tsk(volume), "{volume}");
     }
+}
+
+/// A file or folder: its path, size and times.
+type Listed = (Vec<String>, u64, Times);
+
+fn listed(entry: &FileEntry) -> Listed {
+    (entry.path.clone(), entry.size, entry.times)
+}
+
+/// Every directory's stream, read back: the files and folders it lists
+/// are the volume's, with their sizes and times, and the entry each says
+/// holds its times does.
+#[test]
+fn each_directory_lists_its_entries() {
+    for volume in ["fat12", "fat16", "fat32", "exfat"] {
+        let (mut disk, fat) = open(volume);
+        let format = fat.kind().directory_format();
+        let directories = fat.directories();
+        assert!(directories[0].path.is_empty(), "the root's first");
+        let (mut files, mut folders): (Vec<Listed>, Vec<Listed>) = (Vec::new(), Vec::new());
+        for directory in &directories {
+            assert_eq!(directory.kind, StreamKind::Directory);
+            assert_eq!(directory.stream.as_deref(), Some(format.stream()));
+            let mut bytes = Vec::new();
+            fat.read(&mut disk, directory, &mut |r| {
+                r.read_to_end(&mut bytes).map(|_| ())
+            })
+            .unwrap();
+            assert_eq!(bytes.len() as u64, directory.size, "{volume}");
+            for entry in format.entries(&bytes) {
+                let at = entry.offset as usize;
+                match format {
+                    DirectoryFormat::Fat => {
+                        assert_eq!(u16::from(bytes[at + 11]), entry.attributes);
+                    }
+                    DirectoryFormat::ExFat => assert_eq!(bytes[at], 0x85),
+                }
+                let mut path = directory.path.clone();
+                path.push(entry.name);
+                if entry.is_directory {
+                    folders.push((path, 0, entry.times));
+                } else {
+                    files.push((path, entry.size, entry.times));
+                }
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        folders.sort_by(|a, b| a.0.cmp(&b.0));
+        let volume_files: Vec<Listed> = fat.files().iter().map(listed).collect();
+        assert_eq!(files, volume_files, "{volume}");
+        let volume_folders: Vec<Listed> = directories[1..]
+            .iter()
+            .map(|d| (d.path.clone(), 0, d.times))
+            .collect();
+        assert_eq!(folders, volume_folders, "{volume}");
+        assert!(folders
+            .iter()
+            .any(|(path, ..)| path == &["Folder With Long Name"]));
+        assert_eq!(DirectoryFormat::of_stream(format.stream()), Some(format));
+    }
+}
+
+/// A directory index is NTFS's: a FAT volume has none to read.
+#[test]
+fn a_directory_index_is_not_a_fat_directory() {
+    let (mut disk, fat) = open("fat16");
+    let mut root = fat.directories()[0].clone();
+    root.kind = StreamKind::DirectoryIndex;
+    assert!(fat.read(&mut disk, &root, &mut |_| Ok(())).is_err());
+    assert_eq!(DirectoryFormat::of_stream("$I30"), None);
 }
 
 /// A boot sector claiming more clusters than the volume holds: the count

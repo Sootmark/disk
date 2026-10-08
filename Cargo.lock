@@ -248,7 +248,7 @@ checksum = "779467ccbb98b0f2b9399b90acbbdebd028f9c8fbdf5b84d2fe81c04ed0c149e"
 
 [[package]]
 name = "sootmark-disk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "sootmark-common",

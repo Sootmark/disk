@@ -31,16 +31,19 @@ use crate::partition::read_at;
 use crate::times::Times;
 use crate::window::Window;
 
-/// One file, one alternate data stream of a file, or one directory's index.
+/// One file, one alternate data stream of a file, or one directory's index
+/// (NTFS) or entries (FAT, exFAT).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     /// Path components from the volume root (of the directory, for its
-    /// index: empty for the root's).
+    /// index or entries: empty for the root's).
     pub path: Vec<String>,
-    /// MFT record number.
+    /// MFT record number; on a FAT or exFAT volume, the entry's index in
+    /// its listing.
     pub record: u64,
     /// Alternate data stream name, or `None` for the default stream; for a
-    /// directory index, the index's name (`$I30`).
+    /// directory index, the index's name (`$I30`); for a FAT or exFAT
+    /// directory, its [`DirectoryFormat`](crate::DirectoryFormat)'s stream.
     pub stream: Option<String>,
     /// Which attribute the bytes come from.
     pub kind: StreamKind,
@@ -60,12 +63,16 @@ pub enum StreamKind {
     /// `$INDEX_ALLOCATION`: a directory's index, as INDX blocks (see
     /// [`NtfsVolume::directory_indexes`]).
     DirectoryIndex,
+    /// A FAT or exFAT directory's entries, as its clusters store them (see
+    /// [`FatVolume::directories`](crate::FatVolume::directories)).
+    Directory,
 }
 
 impl FileEntry {
     /// The path joined with `\`, the way Windows writes it: with `:stream`
-    /// appended for alternate data streams, and `:$I30:$INDEX_ALLOCATION`
-    /// for a directory index.
+    /// appended for alternate data streams, `:$I30:$INDEX_ALLOCATION` for
+    /// a directory index, and the stream as a last component for a FAT or
+    /// exFAT directory (`Folder\$FAT_DIRECTORY`).
     #[must_use]
     pub fn display_path(&self) -> String {
         let path = self.path.join("\\");
@@ -74,6 +81,8 @@ impl FileEntry {
             (Some(stream), StreamKind::DirectoryIndex) => {
                 format!("{path}:{stream}:$INDEX_ALLOCATION")
             }
+            (Some(stream), StreamKind::Directory) if path.is_empty() => stream.clone(),
+            (Some(stream), StreamKind::Directory) => format!("{path}\\{stream}"),
             (None, _) => path,
         }
     }

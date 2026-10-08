@@ -82,7 +82,8 @@ mod fat {
         })
     }
 
-    /// Open, list and read everything; only a panic (or a hang) fails.
+    /// Open, list and read everything, each directory's entries decoded;
+    /// only a panic (or a hang) fails.
     fn walk(image: Vec<u8>) {
         let length = image.len() as u64;
         let mut disk = Cursor::new(image);
@@ -92,6 +93,15 @@ mod fat {
         for file in volume.files() {
             let _ = volume.read(&mut disk, &file, &mut |r| {
                 r.take(READ_BUDGET).read_to_end(&mut Vec::new()).map(|_| ())
+            });
+        }
+        let format = volume.kind().directory_format();
+        for directory in volume.directories() {
+            let _ = volume.read(&mut disk, &directory, &mut |r| {
+                let mut entries = Vec::new();
+                r.take(READ_BUDGET).read_to_end(&mut entries)?;
+                let _ = format.entries(&entries);
+                Ok(())
             });
         }
     }

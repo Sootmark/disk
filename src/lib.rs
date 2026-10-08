@@ -6,7 +6,9 @@
 //! - [`NtfsVolume`]: list allocated files and alternate data streams, and
 //!   stream their content without extracting anything; and each
 //!   directory's `$I30` index, slack included.
-//! - [`FatVolume`]: the same for FAT12, FAT16, FAT32 and exFAT.
+//! - [`FatVolume`]: the same for FAT12, FAT16, FAT32 and exFAT, each
+//!   directory's entries as stored included, which
+//!   [`DirectoryFormat::entries`] reads.
 //! - [`Mft`]: a loose `$MFT`, as triage collections copy it: every file
 //!   record, deleted ones included, with its path, `$FILE_NAME` attributes
 //!   and streams.
@@ -23,7 +25,7 @@ mod split;
 mod times;
 mod window;
 
-pub use fat::{FatKind, FatVolume};
+pub use fat::{DirectoryEntry, DirectoryFormat, FatKind, FatVolume};
 pub use filesystem::{identify, Filesystem};
 pub use ntfs::{
     DataStream, FileEntry, FileName, Mft, MftFile, MftProblem, Namespace, NtfsVolume, StreamKind,

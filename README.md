@@ -1,6 +1,6 @@
 # disk
 
-Disk images for forensic intake: raw and split raw images, GPT and MBR partition tables, file-system identification, and NTFS, FAT and exFAT file listing (with times) and streaming reads, alternate data streams and NTFS directory indexes (`$I30`) included. Also loose `$MFT` files, as triage collections copy them: every record, deleted files included. Nothing is extracted to disk. Written from scratch; the only dependency is [`Sootmark/common`](https://github.com/Sootmark/common).
+Disk images for forensic intake: raw and split raw images, GPT and MBR partition tables, file-system identification, and NTFS, FAT and exFAT file listing (with times) and streaming reads, alternate data streams, NTFS directory indexes (`$I30`) and FAT and exFAT directories included. Also loose `$MFT` files, as triage collections copy them: every record, deleted files included. Nothing is extracted to disk. Written from scratch; the only dependency is [`Sootmark/common`](https://github.com/Sootmark/common).
 
 ```toml
 [dependencies]
@@ -38,6 +38,28 @@ for index in volume.directory_indexes(&mut image)? {
 
 Only folders whose index outgrew their MFT record have one (the root's included, with an empty path); a small folder's index lives in the record (`$INDEX_ROOT`). The blocks are given as stored, update-sequence fixups not applied, as The Sleuth Kit's `icat` gives them: an INDX parser verifies them.
 
+A FAT or exFAT folder's entries (the 32-byte entries, or exFAT's entry sets, as its clusters store them, deleted ones and slack included) are a stream too, named after their format, and `DirectoryFormat::entries` reads the files and folders they list, each with the offset of the entry holding its times:
+
+```rust
+use sootmark_disk::FatVolume;
+
+let fat = FatVolume::open(&mut image, part.offset, part.length)?;
+let format = fat.kind().directory_format();
+for directory in fat.directories() {
+    // `Photos\$FAT_DIRECTORY` (exFAT's `$EXFAT_DIRECTORY`), kind `StreamKind::Directory`
+    fat.read(&mut image, &directory, &mut |r| {
+        let mut entries = Vec::new();
+        r.read_to_end(&mut entries)?;
+        for entry in format.entries(&entries) {
+            println!("{} at {} ({} bytes)", entry.name, entry.offset, entry.size);
+        }
+        Ok(())
+    })?;
+}
+```
+
+Every folder has one, the root's included (with an empty path); a file's times live in its folder's entry, since FAT has no `$MFT`.
+
 A loose `$MFT` (from KAPE, Velociraptor, acquire…) needs no volume:
 
 ```rust
@@ -66,7 +88,7 @@ Each file has its `$STANDARD_INFORMATION` times, every `$FILE_NAME` (namespace, 
 | Directory indexes (the root's `$I30`, the only one outgrowing its record) | byte-identical to `icat` |
 | Split images (`.001`, `.002`, …) | read identically to the whole image |
 
-FAT and exFAT: `tests/fixtures/fat/` holds a FAT12, a FAT16, a FAT32 and an exFAT volume written on Linux (long names with accents, nested folders, files fragmented around deleted ones, an empty file); every allocated file and its content match The Sleuth Kit (`fls`, `icat`). On NIST's CFReDS Data Leakage USB images (not redistributed), the exFAT drive's files match TSK's allocated tree; the FAT32 drive holds none (its files were deleted).
+FAT and exFAT: `tests/fixtures/fat/` holds a FAT12, a FAT16, a FAT32 and an exFAT volume written on Linux (long names with accents, nested folders, files fragmented around deleted ones, an empty file); every allocated file and its content match The Sleuth Kit (`fls`, `icat`). On NIST's CFReDS Data Leakage USB images (not redistributed), the exFAT drive's files match TSK's allocated tree; the FAT32 drive holds none (its files were deleted). Each folder's entries, read back with `DirectoryFormat::entries`, list exactly the volume's files and folders, with their sizes and times; on a FAT32, a FAT16 and an exFAT volume written with known times, every entry's path, size and times match `fls -r -m` to the second (checked through `sootmark-adapters` in the Sootmark app's tests).
 
 Compressed files (LZNT1): `tests/fixtures/ntfs-compressed.img.zlib` is a volume written by ntfs-3g (a compressed folder holding text, incompressible, mixed and sparse files, and a plain copy); every file reads as ntfs-3g reads it. On a real Windows Server 2022 image (CFReDS "Compromised Windows Server 2022", not redistributed), all 268 compressed files read identically to ntfs-3g.
 
@@ -100,7 +122,7 @@ Declared sizes are not proof of data: sparse streams (`$UsnJrnl:$J`) legitimatel
 
 ## Scope
 
-NTFS allocated files and named streams, compressed (LZNT1) streams decompressed a compression unit at a time, and allocated directories' `$I30` index allocations as raw INDX blocks (parsing them is `sootmark-indx`'s job). FAT12, FAT16, FAT32 and exFAT volumes: allocated files (long names included) listed and read through their cluster chains. File times on all of them. Loose `$MFT` files: every record, deleted files included. Not yet: encrypted (EFS) streams (reported as unsupported), deleted files' content, carving, Volume Shadow Copies.
+NTFS allocated files and named streams, compressed (LZNT1) streams decompressed a compression unit at a time, and allocated directories' `$I30` index allocations as raw INDX blocks (parsing them is `sootmark-indx`'s job). FAT12, FAT16, FAT32 and exFAT volumes: allocated files (long names included) listed and read through their cluster chains, and each folder's entries as a stream, with a reader for them. File times on all of them. Loose `$MFT` files: every record, deleted files included. Not yet: encrypted (EFS) streams (reported as unsupported), deleted files' content, carving, Volume Shadow Copies.
 
 ## License
 

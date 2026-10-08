@@ -1,6 +1,6 @@
 [package]
 name = "sootmark-disk"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Disk images for forensic intake: raw and split raw images, GPT and MBR partitions, NTFS (alternate data streams, compression, directory indexes), FAT and exFAT file listing with times, streaming reads, and loose $MFT files (deleted files included)."
