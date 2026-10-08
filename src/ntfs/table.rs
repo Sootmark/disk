@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read};
 
 use super::mft::{FileName, MftProblem};
-use super::record::{self, kind, Attribute, Body, Record};
+use super::record::{self, kind, Attribute, Body, Record, DIRECTORY_INDEX};
 use crate::times::Times;
 
 /// Record number of the root directory.
@@ -35,6 +35,9 @@ pub(crate) struct Node {
     pub(crate) names: Vec<FileName>,
     /// `$DATA` attributes: the base record's, then its extension records'.
     pub(crate) data: Vec<Attribute>,
+    /// `$INDEX_ALLOCATION:$I30` attributes, in the same order: a
+    /// directory's index, once it outgrew the record.
+    pub(crate) index: Vec<Attribute>,
 }
 
 impl Table {
@@ -147,6 +150,7 @@ impl Node {
             times: None,
             names: Vec::new(),
             data: Vec::new(),
+            index: Vec::new(),
         };
         node.absorb(number, record.attributes, problems);
         node
@@ -158,6 +162,10 @@ impl Node {
         for attribute in attributes {
             if attribute.kind == kind::DATA {
                 self.data.push(attribute);
+                continue;
+            }
+            if attribute.kind == kind::INDEX_ALLOCATION && attribute.name == DIRECTORY_INDEX {
+                self.index.push(attribute);
                 continue;
             }
             // `$STANDARD_INFORMATION` and `$FILE_NAME` are always resident.
@@ -213,21 +221,31 @@ impl Node {
         self.data.iter().filter(move |a| a.name == name)
     }
 
-    /// The size stream `name` declares: its resident value's length, or the
-    /// real size on its first non-resident piece.
+    /// The size stream `name` declares.
     pub(crate) fn stream_size(&self, name: &str) -> u64 {
-        self.pieces(name)
-            .find_map(|a| match &a.body {
-                Body::Resident(bytes) => Some(bytes.len() as u64),
-                Body::NonResident {
-                    first_vcn: 0,
-                    real_size,
-                    ..
-                } => Some(*real_size),
-                Body::NonResident { .. } => None,
-            })
-            .unwrap_or(0)
+        declared_size(self.pieces(name))
     }
+
+    /// The size the directory index allocation declares (0: none).
+    pub(crate) fn index_size(&self) -> u64 {
+        declared_size(self.index.iter())
+    }
+}
+
+/// The size an attribute's pieces declare: its resident value's length, or
+/// the real size on its first non-resident piece.
+fn declared_size<'a>(mut pieces: impl Iterator<Item = &'a Attribute>) -> u64 {
+    pieces
+        .find_map(|a| match &a.body {
+            Body::Resident(bytes) => Some(bytes.len() as u64),
+            Body::NonResident {
+                first_vcn: 0,
+                real_size,
+                ..
+            } => Some(*real_size),
+            Body::NonResident { .. } => None,
+        })
+        .unwrap_or(0)
 }
 
 /// Read until `buffer` is full or the input ends; how many bytes were read.

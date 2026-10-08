@@ -25,7 +25,11 @@ pub(crate) mod kind {
     pub(crate) const STANDARD_INFORMATION: u32 = 0x10;
     pub(crate) const FILE_NAME: u32 = 0x30;
     pub(crate) const DATA: u32 = 0x80;
+    pub(crate) const INDEX_ALLOCATION: u32 = 0xa0;
 }
+
+/// The name of a directory's index of file names.
+pub(crate) const DIRECTORY_INDEX: &str = "$I30";
 
 /// Attribute flags.
 pub(crate) mod flags {

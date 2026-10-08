@@ -1,10 +1,12 @@
 //! NTFS volumes, read from scratch: list allocated files (with alternate
-//! data streams) and stream their content; and loose `$MFT` files.
+//! data streams) and directory indexes, and stream their content; and loose
+//! `$MFT` files.
 //!
 //! The MFT is walked record by record, the way forensic MFT parsers do:
 //! paths are rebuilt from each record's `$FILE_NAME` parent reference, and
 //! attributes stored in extension records are merged into their base record.
-//! Directory indexes are not needed.
+//! Directory indexes are not needed for that: they are only read as
+//! streams of their own.
 
 mod boot;
 mod lznt1;
@@ -20,7 +22,7 @@ use std::io::{self, Read, Seek};
 
 use boot::Boot;
 use reader::{CompressedReader, Extents, StreamReader};
-use record::{flags, kind, Attribute, Body};
+use record::{flags, kind, Attribute, Body, DIRECTORY_INDEX};
 use table::{Table, ROOT_RECORD};
 
 pub use mft::{DataStream, FileName, Mft, MftFile, MftProblem, Namespace};
@@ -29,15 +31,19 @@ use crate::partition::read_at;
 use crate::times::Times;
 use crate::window::Window;
 
-/// One file, or one alternate data stream of a file.
+/// One file, one alternate data stream of a file, or one directory's index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
-    /// Path components from the volume root.
+    /// Path components from the volume root (of the directory, for its
+    /// index: empty for the root's).
     pub path: Vec<String>,
     /// MFT record number.
     pub record: u64,
-    /// Alternate data stream name, or `None` for the default stream.
+    /// Alternate data stream name, or `None` for the default stream; for a
+    /// directory index, the index's name (`$I30`).
     pub stream: Option<String>,
+    /// Which attribute the bytes come from.
+    pub kind: StreamKind,
     /// Declared size of the stream in bytes. Sparse streams (such as
     /// `$UsnJrnl:$J`) legitimately declare far more than they store, and a
     /// corrupt record can declare anything: bound what you read.
@@ -46,16 +52,39 @@ pub struct FileEntry {
     pub times: Times,
 }
 
+/// Which attribute a [`FileEntry`]'s bytes come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamKind {
+    /// `$DATA`: a file's content, or an alternate data stream.
+    Data,
+    /// `$INDEX_ALLOCATION`: a directory's index, as INDX blocks (see
+    /// [`NtfsVolume::directory_indexes`]).
+    DirectoryIndex,
+}
+
 impl FileEntry {
-    /// The path joined with `\`, with `:stream` appended for alternate data
-    /// streams, the way Windows writes it.
+    /// The path joined with `\`, the way Windows writes it: with `:stream`
+    /// appended for alternate data streams, and `:$I30:$INDEX_ALLOCATION`
+    /// for a directory index.
     #[must_use]
     pub fn display_path(&self) -> String {
         let path = self.path.join("\\");
-        match &self.stream {
-            Some(stream) => format!("{path}:{stream}"),
-            None => path,
+        match (&self.stream, self.kind) {
+            (Some(stream), StreamKind::Data) => format!("{path}:{stream}"),
+            (Some(stream), StreamKind::DirectoryIndex) => {
+                format!("{path}:{stream}:$INDEX_ALLOCATION")
+            }
+            (None, _) => path,
         }
+    }
+
+    /// What the volume's index finds the entry's stream by.
+    fn key(&self) -> StreamKey {
+        (
+            self.record,
+            self.kind,
+            self.stream.clone().unwrap_or_default(),
+        )
     }
 }
 
@@ -71,8 +100,12 @@ pub struct NtfsVolume {
 /// The result of walking the MFT once.
 struct Index {
     files: Vec<FileEntry>,
-    streams: HashMap<(u64, String), Stream>,
+    directory_indexes: Vec<FileEntry>,
+    streams: HashMap<StreamKey, Stream>,
 }
+
+/// A stream's record number, kind and name (`""`: the default stream).
+type StreamKey = (u64, StreamKind, String);
 
 #[derive(Debug, Clone)]
 enum Stream {
@@ -117,7 +150,8 @@ impl NtfsVolume {
     }
 
     /// Every allocated file and alternate data stream, sorted by path.
-    /// Directories themselves are not listed (their named streams are).
+    /// Directories themselves are not listed (their named streams are, and
+    /// their indexes by [`directory_indexes`](Self::directory_indexes)).
     ///
     /// # Errors
     /// On read errors or when the MFT can't be walked.
@@ -125,7 +159,24 @@ impl NtfsVolume {
         Ok(self.index(disk)?.files.clone())
     }
 
-    /// Stream the content of `entry` into `consume`.
+    /// Every allocated directory's index (`$INDEX_ALLOCATION:$I30`) that
+    /// outgrew its MFT record, the root's included, sorted by path. A
+    /// directory whose index fits in its record (`$INDEX_ROOT` only) has
+    /// none.
+    ///
+    /// [`read`](Self::read) gives the INDX blocks as stored, update
+    /// sequence fixups not applied, as The Sleuth Kit's `icat` does: index
+    /// parsers verify them. Entries since removed from the directory
+    /// linger in the blocks' slack.
+    ///
+    /// # Errors
+    /// On read errors or when the MFT can't be walked.
+    pub fn directory_indexes<R: Read + Seek>(&self, disk: &mut R) -> io::Result<Vec<FileEntry>> {
+        Ok(self.index(disk)?.directory_indexes.clone())
+    }
+
+    /// Stream the content of `entry` (a file, a stream or a directory
+    /// index) into `consume`.
     ///
     /// Sparse ranges read as zeros without touching the disk, so a hostile
     /// or sparse stream can yield an enormous amount of data: consumers must
@@ -140,11 +191,10 @@ impl NtfsVolume {
         entry: &FileEntry,
         consume: &mut dyn FnMut(&mut dyn Read) -> io::Result<()>,
     ) -> io::Result<()> {
-        let key = (entry.record, entry.stream.clone().unwrap_or_default());
         let stream = self
             .index(disk)?
             .streams
-            .get(&key)
+            .get(&entry.key())
             .cloned()
             .ok_or_else(|| corrupt("no such stream"))?;
         match stream {
@@ -197,39 +247,57 @@ impl NtfsVolume {
     }
 }
 
-/// The in-use files and their streams. Corrupt records are left out.
+/// The in-use files, directory indexes and their streams. Corrupt records
+/// are left out.
 fn build_index(table: &Table) -> Index {
-    let mut files = Vec::new();
-    let mut streams = HashMap::new();
+    let mut index = Index {
+        files: Vec::new(),
+        directory_indexes: Vec::new(),
+        streams: HashMap::new(),
+    };
     for (&number, node) in table.nodes.iter().filter(|(_, node)| node.in_use) {
-        if number == ROOT_RECORD {
-            continue;
-        }
         let Some(path) = table.path_of(number) else {
             continue;
         };
-        for name in node.stream_names() {
-            if node.is_directory && name.is_empty() {
-                continue;
+        let entry = |kind, name: &str, size| FileEntry {
+            path: path.clone(),
+            record: number,
+            stream: (!name.is_empty()).then(|| name.to_owned()),
+            kind,
+            size,
+            times: node.times.unwrap_or_default(),
+        };
+        if number != ROOT_RECORD {
+            for name in node.stream_names() {
+                if node.is_directory && name.is_empty() {
+                    continue;
+                }
+                let file = entry(StreamKind::Data, name, node.stream_size(name));
+                index
+                    .streams
+                    .insert(file.key(), stream_of(node.pieces(name).collect()));
+                index.files.push(file);
             }
-            files.push(FileEntry {
-                path: path.clone(),
-                record: number,
-                stream: (!name.is_empty()).then(|| name.to_owned()),
-                size: node.stream_size(name),
-                times: node.times.unwrap_or_default(),
-            });
-            streams.insert(
-                (number, name.to_owned()),
-                stream_of(node.pieces(name).collect()),
+        }
+        let size = node.index_size();
+        if node.is_directory && size > 0 {
+            let directory_index = entry(StreamKind::DirectoryIndex, DIRECTORY_INDEX, size);
+            index.streams.insert(
+                directory_index.key(),
+                stream_of(node.index.iter().collect()),
             );
+            index.directory_indexes.push(directory_index);
         }
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.stream.cmp(&b.stream)));
-    Index { files, streams }
+    index
+        .files
+        .sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.stream.cmp(&b.stream)));
+    index.directory_indexes.sort_by(|a, b| a.path.cmp(&b.path));
+    index
 }
 
-/// Assemble a `$DATA` stream from its pieces.
+/// Assemble a stream (`$DATA`, or a directory's index allocation) from its
+/// pieces.
 fn stream_of(mut pieces: Vec<&Attribute>) -> Stream {
     if pieces.iter().any(|a| a.flags & flags::ENCRYPTED != 0) {
         return Stream::Unsupported("encrypted (EFS) stream");

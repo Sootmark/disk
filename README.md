@@ -1,10 +1,10 @@
 # disk
 
-Disk images for forensic intake: raw and split raw images, GPT and MBR partition tables, file-system identification, and NTFS, FAT and exFAT file listing (with times) and streaming reads, alternate data streams included. Also loose `$MFT` files, as triage collections copy them: every record, deleted files included. Nothing is extracted to disk. Written from scratch; the only dependency is [`Sootmark/common`](https://github.com/Sootmark/common).
+Disk images for forensic intake: raw and split raw images, GPT and MBR partition tables, file-system identification, and NTFS, FAT and exFAT file listing (with times) and streaming reads, alternate data streams and NTFS directory indexes (`$I30`) included. Also loose `$MFT` files, as triage collections copy them: every record, deleted files included. Nothing is extracted to disk. Written from scratch; the only dependency is [`Sootmark/common`](https://github.com/Sootmark/common).
 
 ```toml
 [dependencies]
-sootmark-disk = "0.3"
+sootmark-disk = "0.4"
 ```
 
 ```rust
@@ -25,6 +25,18 @@ for part in &parts {
 ```
 
 Any `Read + Seek` works as a disk, so container formats (VHDX, E01) plug in by providing one.
+
+A folder's index (`$INDEX_ALLOCATION:$I30`, the INDX blocks listing its entries, with the slack where removed entries linger) is a stream like any other, listed apart from the files so a file listing stays one:
+
+```rust
+for index in volume.directory_indexes(&mut image)? {
+    // `Users\alice:$I30:$INDEX_ALLOCATION`, kind `StreamKind::DirectoryIndex`
+    println!("{} ({} bytes)", index.display_path(), index.size);
+    volume.read(&mut image, &index, &mut |indx| { /* INDX blocks */ Ok(()) })?;
+}
+```
+
+Only folders whose index outgrew their MFT record have one (the root's included, with an empty path); a small folder's index lives in the record (`$INDEX_ROOT`). The blocks are given as stored, update-sequence fixups not applied, as The Sleuth Kit's `icat` gives them: an INDX parser verifies them.
 
 A loose `$MFT` (from KAPE, Velociraptor, acquire…) needs no volume:
 
@@ -51,11 +63,14 @@ Each file has its `$STANDARD_INFORMATION` times, every `$FILE_NAME` (namespace, 
 | Partitions (offsets, lengths, names, types) | identical to `mmls` |
 | Allocated files and alternate data streams | identical set to `fls` (17 entries, `tools.zip:Zone.Identifier` included) |
 | File contents (`$MFT`, `rclone.conf`, `Zone.Identifier`, …) | byte-identical to `icat` (SHA-256) |
+| Directory indexes (the root's `$I30`, the only one outgrowing its record) | byte-identical to `icat` |
 | Split images (`.001`, `.002`, …) | read identically to the whole image |
 
 FAT and exFAT: `tests/fixtures/fat/` holds a FAT12, a FAT16, a FAT32 and an exFAT volume written on Linux (long names with accents, nested folders, files fragmented around deleted ones, an empty file); every allocated file and its content match The Sleuth Kit (`fls`, `icat`). On NIST's CFReDS Data Leakage USB images (not redistributed), the exFAT drive's files match TSK's allocated tree; the FAT32 drive holds none (its files were deleted).
 
 Compressed files (LZNT1): `tests/fixtures/ntfs-compressed.img.zlib` is a volume written by ntfs-3g (a compressed folder holding text, incompressible, mixed and sparse files, and a plain copy); every file reads as ntfs-3g reads it. On a real Windows Server 2022 image (CFReDS "Compromised Windows Server 2022", not redistributed), all 268 compressed files read identically to ntfs-3g.
+
+Directory indexes: `tests/fixtures/indexes/` holds a volume written by ntfs-3g for the purpose, recreated by `make-indexes.py`: a folder of 300 files whose index blocks are scattered over 12 runs, 40 of them deleted since (slack), a folder emptied of all its files (its blocks stay), long names, a folder small enough for its record, and the root. The set of directories with an index allocation, and every index's size and bytes, match `istat` and `icat <image> <record>-160-<id>`.
 
 Loose `$MFT` files: `tests/fixtures/mft/` holds the `$MFT` of `fin-wks-07.img`, of the times volume below, and of a volume written with ntfs-3g for the purpose (files deleted in a live folder, in a deleted folder, and under a folder whose record was reused; an alternate data stream; a file with 24 hard links and a sparse file fragmented into 500 runs, both spilling into extension records behind a `$ATTRIBUTE_LIST`), recreated by `make-mft.py`. Every record reads as The Sleuth Kit reads it (`istat`: allocation, directory flag, sequence number, `$STANDARD_INFORMATION` times, every `$FILE_NAME` with its parent, sizes and times, every `$DATA` stream's residency and size), and every path is one `fls -r -p` gives, deleted and orphaned files included. The first 6000 records of plaso's `test_data/MFT` (a Windows XP system volume, Apache-2.0) read as libfsntfs reads them, 5954 paths included.
 
@@ -75,7 +90,7 @@ Every listed file carries `Times`: created, modified, changed and accessed, each
 
 ## How NTFS is read
 
-The MFT is walked record by record, the way forensic MFT parsers do: update-sequence fixups are verified (torn writes are detected, never silently accepted), paths are rebuilt from each record's `$FILE_NAME` parent reference, and attributes stored in extension records are merged into their base record. A deleted file keeps its last path: a reference still points at its directory when the sequence numbers match, or when that directory was deleted too (freeing a record increments its sequence number). Files whose parent chain is broken (the parent's record reused, missing, or cyclic) are placed under `$OrphanFiles`, as The Sleuth Kit does. Extension records join their base record through the base reference each one carries, so a non-resident `$ATTRIBUTE_LIST` (unreadable in a loose `$MFT`) isn't needed. Sparse ranges and data past the initialized length read as zeros. Compressed streams are read a compression unit (16 clusters) at a time: all clusters allocated means stored as is, none means zeros, and allocated clusters ending early hold LZNT1 data.
+The MFT is walked record by record, the way forensic MFT parsers do: update-sequence fixups are verified (torn writes are detected, never silently accepted), paths are rebuilt from each record's `$FILE_NAME` parent reference, and attributes stored in extension records are merged into their base record. A deleted file keeps its last path: a reference still points at its directory when the sequence numbers match, or when that directory was deleted too (freeing a record increments its sequence number). Files whose parent chain is broken (the parent's record reused, missing, or cyclic) are placed under `$OrphanFiles`, as The Sleuth Kit does. Extension records join their base record through the base reference each one carries, so a non-resident `$ATTRIBUTE_LIST` (unreadable in a loose `$MFT`) isn't needed. Sparse ranges and data past the initialized length read as zeros. A directory's `$INDEX_ALLOCATION:$I30` is read through its runs the same way, its pieces gathered from extension records like `$DATA`'s. Compressed streams are read a compression unit (16 clusters) at a time: all clusters allocated means stored as is, none means zeros, and allocated clusters ending early hold LZNT1 data.
 
 ## Hostile images
 
@@ -85,7 +100,7 @@ Declared sizes are not proof of data: sparse streams (`$UsnJrnl:$J`) legitimatel
 
 ## Scope
 
-NTFS allocated files and named streams, compressed (LZNT1) streams decompressed a compression unit at a time. FAT12, FAT16, FAT32 and exFAT volumes: allocated files (long names included) listed and read through their cluster chains. File times on all of them. Loose `$MFT` files: every record, deleted files included. Not yet: encrypted (EFS) streams (reported as unsupported), deleted files' content, carving, Volume Shadow Copies.
+NTFS allocated files and named streams, compressed (LZNT1) streams decompressed a compression unit at a time, and allocated directories' `$I30` index allocations as raw INDX blocks (parsing them is `sootmark-indx`'s job). FAT12, FAT16, FAT32 and exFAT volumes: allocated files (long names included) listed and read through their cluster chains. File times on all of them. Loose `$MFT` files: every record, deleted files included. Not yet: encrypted (EFS) streams (reported as unsupported), deleted files' content, carving, Volume Shadow Copies.
 
 ## License
 

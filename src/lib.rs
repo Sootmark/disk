@@ -4,7 +4,8 @@
 //! - [`partitions`]: GPT and MBR tables (extended partitions included).
 //! - [`identify`]: which file system a partition holds.
 //! - [`NtfsVolume`]: list allocated files and alternate data streams, and
-//!   stream their content without extracting anything.
+//!   stream their content without extracting anything; and each
+//!   directory's `$I30` index, slack included.
 //! - [`FatVolume`]: the same for FAT12, FAT16, FAT32 and exFAT.
 //! - [`Mft`]: a loose `$MFT`, as triage collections copy it: every file
 //!   record, deleted ones included, with its path, `$FILE_NAME` attributes
@@ -24,7 +25,9 @@ mod window;
 
 pub use fat::{FatKind, FatVolume};
 pub use filesystem::{identify, Filesystem};
-pub use ntfs::{DataStream, FileEntry, FileName, Mft, MftFile, MftProblem, Namespace, NtfsVolume};
+pub use ntfs::{
+    DataStream, FileEntry, FileName, Mft, MftFile, MftProblem, Namespace, NtfsVolume, StreamKind,
+};
 pub use partition::{partitions, Partition, PartitionType, Scheme, SECTOR_SIZE};
 pub use split::SplitImage;
 pub use times::Times;

@@ -143,6 +143,23 @@ fn content_matches_icat() {
     assert_eq!(by_path(r"Users\Public\rclone.exe").size, 6_000);
 }
 
+/// Only the root's index outgrew its record (`istat`): its INDX block is
+/// `icat -o 256 fin-wks-07.img 5-160-3`.
+#[test]
+fn the_root_index_matches_icat() {
+    let (mut disk, length) = image();
+    let volume = ntfs_volume(&mut disk, length);
+    let indexes = volume.directory_indexes(&mut disk).unwrap();
+    let [root] = indexes.as_slice() else {
+        panic!("one directory index expected, got {indexes:?}");
+    };
+    assert_eq!((root.record, root.size), (5, 4096));
+    assert_eq!(
+        sha256_of(&volume, &mut disk, root),
+        "5e444227ab26ee2891383af375480c94b8caab77be1f7788e5664fb039cb0e67"
+    );
+}
+
 /// `$STANDARD_INFORMATION` times, as `istat` reads them: m64.exe's are
 /// timestomped to 2019 (its `$FILE_NAME` keeps 2026), and tools.zip's are
 /// its Zone.Identifier stream's too.

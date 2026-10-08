@@ -20,7 +20,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use common::time::{Precision, Ts, TICKS_PER_SECOND};
 
-use crate::ntfs::FileEntry;
+use crate::ntfs::{FileEntry, StreamKind};
 use crate::times::{known, Times};
 use crate::window::Window;
 
@@ -419,6 +419,7 @@ impl FatVolume {
                             path: child_path,
                             record: 0,
                             stream: None,
+                            kind: StreamKind::Data,
                             size: child.extent.size,
                             times: child.times,
                         },

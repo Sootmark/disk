@@ -25,10 +25,12 @@ fn walk(image: Vec<u8>) {
         let Ok(volume) = NtfsVolume::open(&mut disk, part.offset, part.length) else {
             continue;
         };
-        let Ok(files) = volume.files(&mut disk) else {
+        let (Ok(files), Ok(indexes)) =
+            (volume.files(&mut disk), volume.directory_indexes(&mut disk))
+        else {
             continue;
         };
-        for file in &files {
+        for file in files.iter().chain(&indexes) {
             let _ = volume.read(&mut disk, file, &mut |r| {
                 r.take(READ_BUDGET).read_to_end(&mut Vec::new()).map(|_| ())
             });
